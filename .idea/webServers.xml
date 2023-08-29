@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="19102536-39eb-4a37-9c71-5d131646b2c4" name="WSL" url="http://localhost">
+        <fileTransfer rootFolder="/home/anti" accessType="SFTP" host="localhost" port="2222" sshConfigId="7721495d-0619-4302-aa4f-3901dd67afce" sshConfig="anti@localhost:2222 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
