@@ -6,46 +6,54 @@ package main
 // go run mrsequential.go wc.so pg*.txt
 //
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+)
 import "6.824/mr"
 import "plugin"
 import "os"
 import "log"
-import "io/ioutil"
 import "sort"
 
-// for sorting by key.
+// ByKey for sorting by key.
 type ByKey []mr.KeyValue
 
-// for sorting by key.
+// Len for sorting by key.
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: mrsequential xxx.so inputfiles...\n")
+		_, err := fmt.Fprintf(os.Stderr, "Usage: mrsequential xxx.so inputfiles...\n")
+		if err != nil {
+			return
+		}
 		os.Exit(1)
 	}
 
-	mapf, reducef := loadPlugin(os.Args[1])
+	mapf, reducef := loadPlugin(os.Args[1]) // 通过命令行参数，指定map和reduce函数。go run -race mrsequential.go wc.so pg*.txt 使用wc中的函数
 
 	//
 	// read each input file,
 	// pass it to Map,
 	// accumulate the intermediate Map output.
 	//
-	intermediate := []mr.KeyValue{}
+	var intermediate []mr.KeyValue
 	for _, filename := range os.Args[2:] {
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
 		}
-		content, err := ioutil.ReadAll(file)
+		content, err := io.ReadAll(file)
 		if err != nil {
 			log.Fatalf("cannot read %v", filename)
 		}
-		file.Close()
+		err = file.Close()
+		if err != nil {
+			return
+		}
 		kva := mapf(filename, string(content))
 		intermediate = append(intermediate, kva...)
 	}
@@ -71,14 +79,18 @@ func main() {
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 			j++
 		}
-		values := []string{}
+		var values []string
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		_, fprintf := fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		if fprintf != nil {
+			return
+		}
 
 		i = j
 	}
@@ -86,10 +98,9 @@ func main() {
 	ofile.Close()
 }
 
-//
+// loadPlugin
 // load the application Map and Reduce functions
 // from a plugin file, e.g. ../mrapps/wc.so
-//
 func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
 	p, err := plugin.Open(filename)
 	if err != nil {
