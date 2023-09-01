@@ -9,6 +9,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 )
 import "6.824/mr"
 import "plugin"
@@ -32,9 +33,13 @@ func main() {
 		}
 		os.Exit(1)
 	}
-
+	path, _ := os.Getwd()
+	fmt.Println("Work Path is", path)
+	dir, _ := ioutil.ReadDir("/home/anti/projects/6.824/src/main")
+	fmt.Println(dir)
 	mapf, reducef := loadPlugin(os.Args[1]) // 通过命令行参数，指定map和reduce函数。go run -race mrsequential.go wc.so pg*.txt 使用wc中的函数
 
+	log.Println("Start Read file, arg num is", len(os.Args))
 	//
 	// read each input file,
 	// pass it to Map,
@@ -42,6 +47,7 @@ func main() {
 	//
 	var intermediate []mr.KeyValue
 	for _, filename := range os.Args[2:] {
+		log.Printf("%v\n", filename)
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
@@ -57,6 +63,30 @@ func main() {
 		kva := mapf(filename, string(content))
 		intermediate = append(intermediate, kva...)
 	}
+
+	//for _, filePattern := range os.Args[2:] {
+	//	files, err := filepath.Glob(filePattern)
+	//	if err != nil {
+	//		return
+	//	}
+	//	for _, filename := range files[:] {
+	//		file, err := os.Open(filename)
+	//		if err != nil {
+	//			log.Fatalf("cannot open %v", filename)
+	//		}
+	//		content, err := io.ReadAll(file)
+	//		if err != nil {
+	//			log.Fatalf("cannot read %v", filename)
+	//		}
+	//		err = file.Close()
+	//		if err != nil {
+	//			return
+	//		}
+	//		kva := mapf(filename, string(content))
+	//		intermediate = append(intermediate, kva...)
+	//	}
+	//
+	//}
 
 	//
 	// a big difference from real MapReduce is that all the
@@ -104,7 +134,7 @@ func main() {
 func loadPlugin(filename string) (func(string, string) []mr.KeyValue, func(string, []string) string) {
 	p, err := plugin.Open(filename)
 	if err != nil {
-		log.Fatalf("cannot load plugin %v", filename)
+		log.Fatalf("cannot load plugin %v err: %v", filename, err.Error())
 	}
 	xmapf, err := p.Lookup("Map")
 	if err != nil {
