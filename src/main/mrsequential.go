@@ -7,6 +7,7 @@ package main
 //
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -95,7 +96,27 @@ func main() {
 	//
 
 	sort.Sort(ByKey(intermediate))
-
+	{
+		oname := "mr-tmp-0"
+		ofile, err := os.Create(oname)
+		if err != nil {
+			log.Fatal("Can't Create Intermediate File: ", oname)
+		}
+		defer func(file *os.File, oname string) {
+			err := file.Close()
+			if err != nil {
+				log.Fatal("Can't Close Intermediate File", oname)
+			}
+		}(ofile, oname)
+		encoder := json.NewEncoder(ofile)
+		for _, kv := range intermediate {
+			err := encoder.Encode(kv)
+			if err != nil {
+				log.Fatal("Encode Error: ", err)
+				return
+			}
+		}
+	}
 	oname := "mr-out-0"
 	ofile, _ := os.Create(oname)
 
@@ -104,6 +125,8 @@ func main() {
 	// and print the result to mr-out-0.
 	//
 	i := 0
+	log.Println("Total kv len: ", len(intermediate))
+	cnt := 0
 	for i < len(intermediate) {
 		j := i + 1
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
@@ -113,6 +136,7 @@ func main() {
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
+		cnt++
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
@@ -124,7 +148,7 @@ func main() {
 
 		i = j
 	}
-
+	log.Println("Unique key count: ", cnt)
 	ofile.Close()
 }
 

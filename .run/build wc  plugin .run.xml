@@ -2,9 +2,8 @@
   <configuration default="false" name="build wc  plugin " type="GoApplicationRunConfiguration" factoryName="Go Application">
     <module name="6.824" />
     <target name="anti@localhost:2222" />
-    <working_directory value="//wsl$/Ubuntu-22.04/home/anti/projects/6.824/src/main" />
-    <go_parameters value=" -race -buildmode=plugin -o ../src/main/wc.so" />
-    <useCustomBuildTags value="true" />
+    <working_directory value="$PROJECT_DIR$/src/mrapps" />
+    <go_parameters value="-race -buildmode=plugin -gcflags=&quot;all=-N -l&quot; -o ../src/main/wc.so" />
     <kind value="FILE" />
     <package value="6.824/main" />
     <directory value="$PROJECT_DIR$/src/mrapps" />

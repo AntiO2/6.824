@@ -53,7 +53,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		req.ReqOp = WorkReq // 请求一个工作
 
 		res := ResArgs{}
-		ok := call("Coordinator.Appoint", req, res)
+		ok := call("Coordinator.Appoint", &req, &res)
 		if !ok {
 			// 如果Call发生错误
 			log.Println("Maybe Coordinator Server has been closed")
@@ -66,11 +66,13 @@ func Worker(mapf func(string, string) []KeyValue,
 			return
 		case WorkMap:
 			doMap(rpcId, &res, mapf)
-		case WorkReq:
+		case WorkReduce:
 			doReduce(rpcId, &res, reducef)
 		case WorkNothing:
 			// 等待
 			time.Sleep(sleepTime)
+		default:
+			break
 		}
 		time.Sleep(sleepTime)
 	}
@@ -95,10 +97,10 @@ func doMap(rpcId RpcIdT, response *ResArgs, mapf func(string, string) []KeyValue
 	// 需要将kv输出到n路 中间文件中
 	ofiles := make([]*os.File, response.ReduceNumN)
 	encoders := make([]*json.Encoder, response.ReduceNumN)
-	for i := 0; i <= response.ReduceNumN; i++ {
-		// 这里输出的名字是mr-out-ResTaskId-reduceN
+	for i := 0; i < response.ReduceNumN; i++ {
+		// 这里输出的名字是mr-ResTaskId-reduceN
 		// 其中，ResTaskId是0~m的数字
-		oname := "mr-out-" + strconv.Itoa(int(response.ResTaskId)) + "-" + strconv.Itoa(i)
+		oname := "mr-" + strconv.Itoa(int(response.ResTaskId)) + "-" + strconv.Itoa(i)
 		ofiles[i], err = os.Create(oname)
 		if err != nil {
 			log.Fatal("Can't Create Intermediate File: ", oname)
@@ -125,7 +127,7 @@ func doMap(rpcId RpcIdT, response *ResArgs, mapf func(string, string) []KeyValue
 		ReqTaskId: response.ResTaskId,
 	}
 	res := ResArgs{}
-	call("Coordinator.Appoint", req, res)
+	call("Coordinator.Appoint", &req, &res)
 }
 
 func doReduce(rpcId RpcIdT, response *ResArgs, reducef func(string, []string) string) {
@@ -135,7 +137,7 @@ func doReduce(rpcId RpcIdT, response *ResArgs, reducef func(string, []string) st
 		// 读取所有该rid的中间值
 		func(mapId int) {
 			// 读取m-rid的中间值
-			inputName := "mr-out-" + strconv.Itoa(i) + strconv.Itoa(int(rid))
+			inputName := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(int(rid))
 			// 在当前对应r的输出中，获取所有key
 			ifile, err := os.Open(inputName)
 			if err != nil {
@@ -172,7 +174,10 @@ func doReduce(rpcId RpcIdT, response *ResArgs, reducef func(string, []string) st
 			log.Fatal("Can't close file: ", oname)
 		}
 	}(ofile)
-	for i := 0; i < len(kva); i++ {
+	// log.Println("Total kv len: ", len(intermediate))
+	// cnt := 0
+	i := 0
+	for i < len(intermediate) {
 		j := i + 1
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 			j++
@@ -181,6 +186,7 @@ func doReduce(rpcId RpcIdT, response *ResArgs, reducef func(string, []string) st
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
+		// cnt++
 		output := reducef(intermediate[i].Key, values)
 		// this is the correct format for each line of Reduce output.
 		_, fprintf := fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
@@ -189,14 +195,14 @@ func doReduce(rpcId RpcIdT, response *ResArgs, reducef func(string, []string) st
 		}
 		i = j
 	}
-
+	// log.Println("Unique key count: ", cnt)
 	req := ReqArgs{
 		ReqId:     rpcId,
 		ReqOp:     WorkReduceDone,
 		ReqTaskId: response.ResTaskId,
 	}
 	res := ResArgs{}
-	call("Coordinator.Appoint", req, res)
+	call("Coordinator.Appoint", &req, &res)
 }
 
 // CallExample

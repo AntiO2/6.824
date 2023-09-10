@@ -17,7 +17,7 @@ const (
 	running
 	taskDone
 )
-const workMaxTime = 10 * time.Second
+const workMaxTime = 12 * time.Second
 
 type Coordinator struct {
 	// Your definitions here.
@@ -78,6 +78,7 @@ func (c *Coordinator) Appoint(request *ReqArgs, reply *ResArgs) error {
 				c.mapTaskStatus[taskId] = running
 				c.latch.L.Unlock()
 				go c.checkDone(WorkMap, reply.ResTaskId)
+				log.Printf("Assign map \t%d to \t%d\n", reply.ResTaskId, reply.ResId)
 				return nil
 			}
 			if c.mapCnt < c.mMap {
@@ -85,6 +86,7 @@ func (c *Coordinator) Appoint(request *ReqArgs, reply *ResArgs) error {
 				// worker需要暂时等待一下
 				reply.ResOp = WorkNothing
 				c.latch.L.Unlock()
+				log.Println("Map All assigned but not done")
 				return nil
 			}
 			if len(c.reduceTasks) > 0 {
@@ -96,15 +98,18 @@ func (c *Coordinator) Appoint(request *ReqArgs, reply *ResArgs) error {
 				c.reduceTaskStatus[taskId] = running
 				c.latch.L.Unlock()
 				go c.checkDone(WorkReduce, reply.ResTaskId)
+				log.Printf("Assign reduce \t%d to \t%d\n", reply.ResTaskId, reply.ResId)
 				return nil
 			}
 			// 如果分配完了所有的reduce,但是还没有done.worker需要等待
 			reply.ResOp = WorkNothing
+			log.Println("Reduce All assigned but not done")
 			c.latch.L.Unlock()
 			return nil
 		}
 	case WorkMapDone:
 		{
+
 			c.latch.L.Lock()
 			defer c.latch.L.Unlock()
 			if c.runningMap[request.ReqTaskId] != request.ReqId || c.mapTaskStatus[request.ReqTaskId] != running {
@@ -112,6 +117,7 @@ func (c *Coordinator) Appoint(request *ReqArgs, reply *ResArgs) error {
 				reply.ResOp = WorkTerminate
 				return nil
 			}
+			log.Printf("Work Map \t%d done by \t%d\n", request.ReqTaskId, request.ReqId)
 			c.mapTaskStatus[request.ReqTaskId] = taskDone
 			c.mapCnt++
 		}
@@ -126,8 +132,10 @@ func (c *Coordinator) Appoint(request *ReqArgs, reply *ResArgs) error {
 			}
 			c.reduceTaskStatus[request.ReqTaskId] = taskDone
 			c.reduceCnt++
+			log.Printf("Work Reduce \t%d done by \t%d\n", request.ReqTaskId, request.ReqId)
 			if c.reduceCnt == c.nReduce {
 				c.taskDone = true
+				reply.ResOp = WorkDone
 			}
 		}
 	default:
@@ -138,6 +146,7 @@ func (c *Coordinator) Appoint(request *ReqArgs, reply *ResArgs) error {
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
+	log.Println("Launching Server")
 	e := rpc.Register(c)
 	if e != nil {
 		log.Fatal("register error:", e)
@@ -148,10 +157,15 @@ func (c *Coordinator) server() {
 	_ = os.Remove(sockname)
 
 	l, e := net.Listen("unix", sockname)
-	defer func(l net.Listener) {
-		err := l.Close()
-		if err != nil {
-			log.Fatal("close error:", err)
+	go func(l net.Listener) {
+		for {
+			time.Sleep(5 * time.Second)
+			if c.Done() {
+				err := l.Close()
+				if err != nil {
+					log.Fatal("close error:", err)
+				}
+			}
 		}
 	}(l)
 
@@ -206,6 +220,7 @@ func (c *Coordinator) checkDone(workType WorkType, t TaskIdT) {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	log.Println("Launching Master Factory")
 	c := Coordinator{}
 	c.nReduce = nReduce
 	c.mMap = len(files) // 每个file对应一个map
@@ -221,12 +236,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.runningReduce = make([]RpcIdT, nReduce)
 	c.latch = sync.NewCond(&sync.Mutex{})
 
-	for i := 0; i <= c.mMap; i++ {
+	for i := 0; i < c.mMap; i++ {
 		c.mapTasks <- TaskIdT(i)
 		c.runningMap[i] = -1
 		c.mapTaskStatus[i] = notStart
 	}
-	for i := 0; i <= c.nReduce; i++ {
+	for i := 0; i < c.nReduce; i++ {
 		c.reduceTasks <- TaskIdT(i)
 		c.runningReduce[i] = -1
 		c.reduceTaskStatus[i] = notStart
