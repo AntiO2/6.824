@@ -78,7 +78,7 @@ type ClientEnd struct {
 	done    chan struct{} // closed when Network is cleaned up
 }
 
-// send an RPC, wait for the reply.
+// Call send an RPC, wait for the reply.
 // the return value indicates success; false means that
 // no reply was received from the server.
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
@@ -417,8 +417,8 @@ func (rs *Server) dispatch(req reqMsg) replyMsg {
 	if ok {
 		return service.dispatch(methodName, req)
 	} else {
-		choices := []string{}
-		for k, _ := range rs.services {
+		var choices []string
+		for k := range rs.services {
 			choices = append(choices, k)
 		}
 		log.Fatalf("labrpc.Server.dispatch(): unknown service %v in %v.%v; expecting one of %v\n",
@@ -482,7 +482,10 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 		// decode the argument.
 		ab := bytes.NewBuffer(req.args)
 		ad := labgob.NewDecoder(ab)
-		ad.Decode(args.Interface())
+		err := ad.Decode(args.Interface())
+		if err != nil {
+			return replyMsg{}
+		}
 
 		// allocate space for the reply.
 		replyType := method.Type.In(2)
