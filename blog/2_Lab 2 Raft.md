@@ -347,7 +347,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 
 
 
-最后根据Figure2 实现RPC Handler
+最后根据Figure2 实现RPC Handler(不包含Log,仅心跳)
 
 > Receiver implementation:
 >
