@@ -90,8 +90,279 @@ labrpc模拟了可能丢包、延迟的网络环境。
 
 感觉Service更多的指一组API接口，而Server类似一台主机，上面可能运行多个service
 
-
+### 0x22 Raft
 
 > A service calls `Make(peers,me,…)` to create a Raft peer. The peers argument is an array of network identifiers of the Raft peers (including this one), for use with RPC. The `me` argument is the index of this peer in the peers array. 
 
 其中，通过阅读`Persister`代码，其中有序列化和反序列化方法。
+
+## 基础数据结构
+
+
+
+## Lab2a实现
+
+目标：实现Leader选举。不需要携带log(空append entry)
+
+![image-20230913222616047](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230913222616047.png)
+
+```go
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+	candidateTerm termT
+	candidateId   int
+	lastLogEntry  indexT
+	lastLogTerm   termT
+}
+
+// RequestVoteReply example RequestVote RPC reply structure.
+// field names must start with capital letters!
+type RequestVoteReply struct {
+	// Your data here (2A).
+	term termT
+	voteGranted bool 
+}
+```
+
+这里我不确定term和index的数据类型。感觉Index应该用uint（因为有效的index从1开始，可以用0表示无效的index）,但是给的代码中term和index都是int.
+
+> Modify `Make()` to create a background goroutine that will kick off leader election periodically by sending out `RequestVote` RPCs when it hasn't heard from another peer for a while. This way a peer will learn who is the leader, if there is already a leader, or become the leader itself. Implement the `RequestVote()` RPC handler so that servers will vote for one another.
+
+这里首先实现ticker里面的代码。
+
+```C++
+func (rf *Raft) ticker() {
+    rf.setElectionTime()
+    for rf.killed() == false {
+
+       // Your code here to check if a leader election should
+       // be started and to randomize sleeping time using
+       // time.Sleep().
+       time.Sleep(rf.heartBeat)
+       rf.mu.Lock()
+       if rf.status == leader {
+          // 如果是leader状态,发送空包
+       }
+       if time.Now().After(rf.electionTime) {
+          // 如果已经超时， 开始选举
+       }
+       rf.mu.Unlock()
+    }
+}
+```
+
+然后是实现candidate部分的代码：
+
+参考5.2 Leader election中的描述一步一步做
+
+> To begin an election, a follower increments its current
+>
+> term and transitions to candidate state.
+
+```go
+func (rf *Raft) startElection() {
+    rf.setElectionTime()
+    rf.status = candidate
+    rf.currentTerm++
+```
+
+> It then votes for
+>
+> itself and issues RequestVote RPCs in parallel to each of
+>
+> the other servers in the cluster. 
+
+```go
+rf.votedFor = rf.me
+rf.persist()
+var convert sync.Once
+for i := range rf.peers {
+    if i != rf.me {
+       var reply RequestVoteReply
+       request := RequestVoteArgs{
+          candidateTerm: rf.currentTerm,
+          candidateId:   rf.me,
+          lastLogEntry:  rf.getLastLogIndex(),
+          lastLogTerm:   rf.getLastLogTerm(),
+       }
+       go rf.sendRequestVote(i, &request, &reply, &convert)
+    }
+}
+```
+
+继续往下阅读
+
+> A candidate continues in
+>
+> this state until one of three things happens: 
+>
+> - (a) it wins theelection
+> - (b) another server establishes itself as leader, or
+>
+> - (c) a period of time goes by with no winner.
+
+其中，(c) 通过ticker函数解决超时未选举问题
+
+(b) 在接受心跳信息中实现
+
+(a) 在每次收到**有效的**选票后，统计自己是否赢得选举
+
+首先实现a
+
+```go
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, convert *sync.Once, countVote *int) bool {
+    ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+    if !ok {
+       return ok
+    }
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if reply.term > rf.currentTerm {
+       rf.setTerm(reply.term)
+       rf.status = follower
+       return false
+    }
+    if reply.term < rf.currentTerm {
+       // 过期得rpc
+       return false
+    }
+    if !reply.voteGranted {
+       return false
+    }
+    *countVote++
+    if *countVote >= rf.peerNum/2 &&
+       rf.status == candidate &&
+       rf.currentTerm == args.candidateTerm {
+       // 投票成功，转为leader
+       convert.Do(func() {
+          /**
+          nextIndex for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+          */
+          nextIndex := rf.getLastLogIndex() + 1
+          rf.status = leader
+          for i := 0; i < rf.votedFor; i++ {
+             rf.nextIndex[i] = nextIndex
+             rf.matchIndex[i] = 0
+          }
+          rf.appendEntries(true)
+       })
+    }
+    return ok
+}
+```
+
+相对应的，实现投票规则。
+
+- 如果在该term投了票，并且不是该candidateId, 则拒绝该次投票
+- 如果term < currentTerm  拒绝投票
+- 如果candidate的参数至少和当前follower一样新，则投票
+
+```go
+// RequestVote RPC handler.
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.candidateTerm > rf.currentTerm {
+		rf.setTerm(args.candidateTerm)
+	}
+	reply.term = rf.currentTerm
+	if rf.currentTerm > args.candidateTerm {
+		reply.voteGranted = false
+		return
+	}
+	lastLogTerm := rf.getLastLogTerm()
+	lastLogIndex := rf.getLastLogIndex()
+	if (rf.votedFor == -1 || rf.votedFor == args.candidateId) &&
+		(lastLogTerm < args.lastLogTerm || lastLogIndex <= args.lastLogEntry) {
+		reply.voteGranted = true
+
+		rf.votedFor = args.candidateId
+		rf.persist()
+		rf.setElectionTime()
+	} else {
+		reply.voteGranted = false
+	}
+}
+```
+
+接下来，实现发送心跳信息。
+
+首先实现appendEntry需要的数据结构
+
+```go
+ype appendEntryArgs struct {
+    term         termT  //leader’s term
+    leaderId     int    // so follower can redirect clients
+    prevLogIndex indexT //index of log entry immediately preceding new ones
+    prevLogTerm  termT  // term of prevLogIndex entry
+    entries      []Log  // log entries to store (empty for heartbeat; may send more than one for efficiency)
+    leaderCommit indexT // leader’s commitIndex
+}
+
+type appendEntryReply struct {
+    term    termT // currentTerm, for leader to update itself
+    success bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+func (rf *Raft) AppendEntriesRPC(args appendEntryArgs, reply appendEntryReply) {
+    
+}
+```
+
+实现leader发送心跳信息(在lab2A中，prevLog的参数都还不对)
+
+```go
+func (rf *Raft) appendEntries(heartBeat bool) {
+
+    for i := range rf.peers {
+       if i != rf.me {
+          args := appendEntryArgs{
+             term:         rf.currentTerm,
+             leaderId:     rf.me,
+             prevLogIndex: rf.getLastLogIndex(),
+             prevLogTerm:  rf.getLastLogTerm(),
+             entries:      nil,
+             leaderCommit: rf.commitIndex,
+          }
+          if heartBeat {
+             go func(rf *Raft, args *appendEntryArgs, peerId int) {
+                client := rf.peers[peerId]
+                var reply appendEntryReply
+                client.Call("Raft.AppendEntriesRPC", args, &reply)
+                rf.mu.Lock()
+                defer rf.mu.Unlock()
+                if reply.term > rf.currentTerm {
+                   rf.setTerm(reply.term)
+                   rf.setElectionTime()
+                   rf.status = follower
+                   return
+                }
+             }(rf, &args, i)
+          }
+       }
+    }
+}
+```
+
+
+
+最后根据Figure2 实现RPC Handler
+
+> Receiver implementation:
+>
+> 1. Reply false if term < currentTerm (§5.1)
+> 2. Reply false if log doesn’t contain an entry at prevLogIndex
+>
+> whose term matches prevLogTerm (§5.3)
+>
+> 3. If an existing entry conflicts with a new one (same index
+>
+> but different terms), delete the existing entry and all that
+>
+> follow it (§5.3)
+>
+> 4. Append any new entries not already in the log
+> 5. If leaderCommit > commitIndex, set commitIndex =
+>
+> min(leaderCommit, index of last new entry)
