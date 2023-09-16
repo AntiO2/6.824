@@ -211,44 +211,48 @@ for i := range rf.peers {
 
 ```go
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, convert *sync.Once, countVote *int) bool {
-    ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-    if !ok {
-       return ok
-    }
-    rf.mu.Lock()
-    defer rf.mu.Unlock()
-    if reply.term > rf.currentTerm {
-       rf.setTerm(reply.term)
-       rf.status = follower
-       return false
-    }
-    if reply.term < rf.currentTerm {
-       // 过期得rpc
-       return false
-    }
-    if !reply.voteGranted {
-       return false
-    }
-    *countVote++
-    if *countVote >= rf.peerNum/2 &&
-       rf.status == candidate &&
-       rf.currentTerm == args.candidateTerm {
-       // 投票成功，转为leader
-       convert.Do(func() {
-          /**
-          nextIndex for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-          */
-          nextIndex := rf.getLastLogIndex() + 1
-          rf.status = leader
-          for i := 0; i < rf.votedFor; i++ {
-             rf.nextIndex[i] = nextIndex
-             rf.matchIndex[i] = 0
-          }
-          rf.appendEntries(true)
-       })
-    }
-    return ok
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if !ok {
+		return ok
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.setTerm(reply.Term)
+		// rf.setElectionTime()
+		rf.status = follower
+		return false
+	}
+	if reply.Term < rf.currentTerm {
+		// 过期得rpc
+		return false
+	}
+	if !reply.VoteGranted {
+		return false
+	}
+	*countVote++
+	if *countVote > rf.peerNum/2 &&
+		rf.status == candidate &&
+		rf.currentTerm == args.CandidateTerm {
+		// 投票成功，转为leader
+		convert.Do(func() {
+			log.Printf("[%d] become leader in term [%d]", rf.me, rf.currentTerm)
+			/**
+			nextIndex for each server, Index of the next log entry to send to that server (initialized to leader last log Index + 1)
+			*/
+			nextIndex := rf.getLastLogIndex() + 1
+			rf.status = leader
+			for i := 0; i < rf.votedFor; i++ {
+				rf.nextIndex[i] = nextIndex
+				rf.matchIndex[i] = 0
+				rf.matchIndex[i] = 0
+			}
+			rf.appendEntries(true)
+		})
+	}
+	return ok
 }
+
 ```
 
 相对应的，实现投票规则。
@@ -315,33 +319,33 @@ func (rf *Raft) AppendEntriesRPC(args appendEntryArgs, reply appendEntryReply) {
 ```go
 func (rf *Raft) appendEntries(heartBeat bool) {
 
-    for i := range rf.peers {
-       if i != rf.me {
-          args := appendEntryArgs{
-             term:         rf.currentTerm,
-             leaderId:     rf.me,
-             prevLogIndex: rf.getLastLogIndex(),
-             prevLogTerm:  rf.getLastLogTerm(),
-             entries:      nil,
-             leaderCommit: rf.commitIndex,
-          }
-          if heartBeat {
-             go func(rf *Raft, args *appendEntryArgs, peerId int) {
-                client := rf.peers[peerId]
-                var reply appendEntryReply
-                client.Call("Raft.AppendEntriesRPC", args, &reply)
-                rf.mu.Lock()
-                defer rf.mu.Unlock()
-                if reply.term > rf.currentTerm {
-                   rf.setTerm(reply.term)
-                   rf.setElectionTime()
-                   rf.status = follower
-                   return
-                }
-             }(rf, &args, i)
-          }
-       }
-    }
+	for i := range rf.peers {
+		if i != rf.me {
+			args := appendEntryArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.getLastLogIndex(),
+				PrevLogTerm:  rf.getLastLogTerm(),
+				Entries:      nil,
+				LeaderCommit: rf.commitIndex,
+			}
+			if heartBeat {
+				go func(rf *Raft, args *appendEntryArgs, peerId int) {
+					client := rf.peers[peerId]
+					var reply appendEntryReply
+					client.Call("Raft.AppendEntriesRPC", args, &reply)
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if reply.Term > rf.currentTerm {
+						rf.setTerm(reply.Term)
+						rf.setElectionTime()
+						rf.status = follower
+						return
+					}
+				}(rf, &args, i)
+			}
+		}
+	}
 }
 ```
 
@@ -366,3 +370,234 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 > 5. If leaderCommit > commitIndex, set commitIndex =
 >
 > min(leaderCommit, index of last new entry)
+
+```go
+func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply) {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    reply.Success = false
+    reply.Term = rf.currentTerm
+    if args.Term > rf.currentTerm {
+       rf.status = follower
+       rf.setElectionTime() // check(AntiO2)
+       rf.setTerm(args.Term)
+       return
+    }
+    if args.Term < rf.currentTerm {
+       return
+    }
+    rf.setElectionTime()
+    if rf.status == candidate {
+       rf.status = follower
+    }
+    if args.Entries == nil || len(args.Entries) == 0 {
+       // do heartBeat
+       reply.Success = true
+       return
+    }
+}
+```
+
+记得完成GetState()，用于检测状态。
+
+Debug时遇到的坑：
+
+- 无论是收到AppendEntry的RPC时，发现了更高的term，还是RPC回复中的参数发现了更高的term，都要立即转入follower状态。
+
+- > - The tester requires that the leader send heartbeat RPCs no more than ten times per second.
+
+  好像心跳时间一秒不能超过10次。当我一秒发送100次心跳，能维护只有一个Leader，但是每隔100ms就会出现多个Leader的情况。
+
+比如在测试中出现的这种情况：s3在term8断开连接，在之后还自称leader.
+
+![image-20230915164048988](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230915164048988.png)
+
+![image-20230915164454972](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230915164454972.png)
+
+再看提示：
+
+> - The paper's Section 5.2 mentions election timeouts in the range of 150 to 300 milliseconds. Such a range only makes sense if the leader sends heartbeats considerably more often than once per 150 milliseconds. Because the tester limits you to 10 heartbeats per second, you will have to use an election timeout larger than the paper's 150 to 300 milliseconds, but not too large, because then you may fail to elect a leader within five seconds.
+
+因为Leader每100ms发送一次超时信息，来不及在Follower进入超时选举状态之前更新，所以要增大超时选举的时间。（要求在超时时间中，发送more often than once） 这里我将超时时间设置成了300~500ms.
+
+再仔细检查，发现忽略了一种情况：就是收到投票请求时，发现了更高的term，忘了转变为follower状态。
+
+
+
+- 当我在Windows环境下，使用`-race`测试，会报错。上网看了下Issue好像amd会出现这个问题。
+- 发现了没有收到多数票也能赢得选举的问题，然后才检查到判定多数派的选票数应该至少是`(peerNum+2)/2`
+
+![image-20230915172619453](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230915172619453.png)
+
+
+
+在测试时发现一次错误Log如下
+
+```tex
+2023/09/15 18:03:20 Disconnect : [2] [5] [3]
+2023/09/15 18:03:21 [4] Time Out,Start Election Term [4]
+2023/09/15 18:03:21 [3] Time Out,Start Election Term [4]
+2023/09/15 18:03:21 [1] Time Out,Start Election Term [4]
+2023/09/15 18:03:21 [0] Time Out,Start Election Term [4]
+2023/09/15 18:03:21 [6] Vote To [4] In term [4]
+2023/09/15 18:03:21 [2] Time Out,Start Election Term [4]
+2023/09/15 18:03:21 [4] Time Out,Start Election Term [5]
+2023/09/15 18:03:21 [1] Time Out,Start Election Term [5]
+2023/09/15 18:03:21 [0] Time Out,Start Election Term [5]
+2023/09/15 18:03:21 [6] Vote To [1] In term [5]
+2023/09/15 18:03:21 [3] Time Out,Start Election Term [5]
+2023/09/15 18:03:21 [2] Time Out,Start Election Term [5]
+2023/09/15 18:03:22 [3] Time Out,Start Election Term [6]
+2023/09/15 18:03:22 [0] Time Out,Start Election Term [6]
+2023/09/15 18:03:22 [4] Time Out,Start Election Term [6]
+2023/09/15 18:03:22 [1] Vote To [0] In term [6]
+2023/09/15 18:03:22 [6] Vote To [0] In term [6]
+2023/09/15 18:03:22 [2] Time Out,Start Election Term [6]
+2023/09/15 18:03:22 [4] Time Out,Start Election Term [7]
+2023/09/15 18:03:22 [6] Time Out,Start Election Term [7]
+2023/09/15 18:03:22 [0] Time Out,Start Election Term [7]
+2023/09/15 18:03:22 [1] Vote To [4] In term [7]
+2023/09/15 18:03:22 [3] Time Out,Start Election Term [7]
+2023/09/15 18:03:22 [2] Time Out,Start Election Term [7]
+2023/09/15 18:03:22 [4] Time Out,Start Election Term [8]
+2023/09/15 18:03:22 [1] Time Out,Start Election Term [8]
+2023/09/15 18:03:22 [6] Vote To [1] In term [8]
+2023/09/15 18:03:22 [0] Vote To [1] In term [8]
+2023/09/15 18:03:22 [3] Time Out,Start Election Term [8]
+2023/09/15 18:03:23 [2] Time Out,Start Election Term [8]
+2023/09/15 18:03:23 [4] Time Out,Start Election Term [9]
+2023/09/15 18:03:23 [0] Time Out,Start Election Term [9]
+2023/09/15 18:03:23 [6] Vote To [0] In term [9]
+2023/09/15 18:03:23 [1] Vote To [0] In term [9]
+2023/09/15 18:03:23 [3] Time Out,Start Election Term [9]
+2023/09/15 18:03:23 [0] Time Out,Start Election Term [10]
+2023/09/15 18:03:23 [6] Time Out,Start Election Term [10]
+2023/09/15 18:03:23 [2] Time Out,Start Election Term [9]
+2023/09/15 18:03:23 [1] Vote To [0] In term [10]
+2023/09/15 18:03:23 [4] Vote To [6] In term [10]
+2023/09/15 18:03:23 [3] Time Out,Start Election Term [10]
+2023/09/15 18:03:24 [0] Time Out,Start Election Term [11]
+2023/09/15 18:03:24 [6] Time Out,Start Election Term [11]
+2023/09/15 18:03:24 [4] Vote To [0] In term [11]
+2023/09/15 18:03:24 [1] Vote To [0] In term [11]
+2023/09/15 18:03:24 [2] Time Out,Start Election Term [10]
+2023/09/15 18:03:24 [3] Time Out,Start Election Term [11]
+2023/09/15 18:03:24 [0] Time Out,Start Election Term [12]
+2023/09/15 18:03:24 [1] Time Out,Start Election Term [12]
+2023/09/15 18:03:24 [6] Vote To [0] In term [12]
+2023/09/15 18:03:24 [4] Vote To [0] In term [12]
+2023/09/15 18:03:24 [2] Time Out,Start Election Term [11]
+2023/09/15 18:03:24 [3] Time Out,Start Election Term [12]
+2023/09/15 18:03:24 [1] Time Out,Start Election Term [13]
+2023/09/15 18:03:24 [0] Time Out,Start Election Term [13]
+2023/09/15 18:03:24 [6] Vote To [1] In term [13]
+2023/09/15 18:03:24 [4] Vote To [1] In term [13]
+2023/09/15 18:03:25 [2] Time Out,Start Election Term [12]
+2023/09/15 18:03:25 [0] Time Out,Start Election Term [14]
+2023/09/15 18:03:25 [3] Time Out,Start Election Term [13]
+2023/09/15 18:03:25 [6] Time Out,Start Election Term [14]
+2023/09/15 18:03:25 [4] Time Out,Start Election Term [14]
+2023/09/15 18:03:25 [1] Vote To [6] In term [14]
+2023/09/15 18:03:25 [2] Time Out,Start Election Term [13]
+2023/09/15 18:03:25 [1] Time Out,Start Election Term [15]
+2023/09/15 18:03:25 [0] Time Out,Start Election Term [15]
+2023/09/15 18:03:25 [3] Time Out,Start Election Term [14]
+2023/09/15 18:03:25 [6] Vote To [0] In term [15]
+2023/09/15 18:03:25 [4] Vote To [1] In term [15]
+2023/09/15 18:03:25 [2] Time Out,Start Election Term [14]
+--- FAIL: TestManyElections2A (6.33s)
+    config.go:398: expected one leader, got none
+```
+
+这里好像都成了candidate，然后没有在5s投票出来有效的leader。从Log看的出来，这里2、5、3都下线了，在集群里面只有0,1,4,6服务器在线。也就是说0，1，4，6中，必须有一个服务器得到4票（全票）才能当选。
+
+比如出现了这种情况：
+
+```go
+2023/09/15 18:03:21 [1] Time Out,Start Election Term [5]
+2023/09/15 18:03:21 [0] Time Out,Start Election Term [5]
+2023/09/15 18:03:21 [6] Vote To [1] In term [5]
+```
+
+1和0几乎同时开始新的选举。在6投票给1之前，0也开始选举，就会出现分票的情况。
+
+为了看的更清楚，将log的时间格式改为毫秒级别
+
+```tex
+2023/09/15 18:15:17 Disconnect : [6] [4] [5]
+2023/09/15 18:15:17.497307 [5] Time Out,Start Election Term [8]
+2023/09/15 18:15:17.497370 [3] Time Out,Start Election Term [8]
+2023/09/15 18:15:17.497607 [1] Time Out,Start Election Term [8]
+2023/09/15 18:15:17.498068 [0] Vote To [3] In term [8]
+2023/09/15 18:15:17.498081 [2] Vote To [1] In term [8]
+2023/09/15 18:15:17.900286 [3] Time Out,Start Election Term [9]
+2023/09/15 18:15:17.900529 [5] Time Out,Start Election Term [9]
+2023/09/15 18:15:17.900757 [2] Time Out,Start Election Term [9]
+2023/09/15 18:15:17.900814 [0] Vote To [3] In term [9]
+2023/09/15 18:15:17.900904 [1] Time Out,Start Election Term [9]
+2023/09/15 18:15:18.302221 [2] Time Out,Start Election Term [10]
+2023/09/15 18:15:18.302400 [0] Time Out,Start Election Term [10]
+2023/09/15 18:15:18.302467 [3] Time Out,Start Election Term [10]
+2023/09/15 18:15:18.302693 [1] Time Out,Start Election Term [10]
+2023/09/15 18:15:18.403276 [5] Time Out,Start Election Term [10]
+2023/09/15 18:15:18.703948 [3] Time Out,Start Election Term [11]
+2023/09/15 18:15:18.704030 [1] Time Out,Start Election Term [11]
+2023/09/15 18:15:18.704036 [0] Time Out,Start Election Term [11]
+2023/09/15 18:15:18.704627 [2] Vote To [3] In term [11]
+2023/09/15 18:15:18.904608 [5] Time Out,Start Election Term [11]
+2023/09/15 18:15:19.206448 [3] Time Out,Start Election Term [12]
+2023/09/15 18:15:19.206490 [0] Time Out,Start Election Term [12]
+2023/09/15 18:15:19.206784 [2] Time Out,Start Election Term [12]
+2023/09/15 18:15:19.207301 [1] Time Out,Start Election Term [12]
+2023/09/15 18:15:19.306922 [5] Time Out,Start Election Term [12]
+2023/09/15 18:15:19.608320 [0] Time Out,Start Election Term [13]
+2023/09/15 18:15:19.608388 [3] Time Out,Start Election Term [13]
+2023/09/15 18:15:19.608350 [1] Time Out,Start Election Term [13]
+2023/09/15 18:15:19.611556 [2] Vote To [1] In term [13]
+2023/09/15 18:15:19.708899 [5] Time Out,Start Election Term [13]
+2023/09/15 18:15:20.010722 [0] Time Out,Start Election Term [14]
+2023/09/15 18:15:20.011113 [3] Time Out,Start Election Term [14]
+2023/09/15 18:15:20.011701 [1] Time Out,Start Election Term [14]
+2023/09/15 18:15:20.011758 [2] Vote To [0] In term [14]
+2023/09/15 18:15:20.111205 [5] Time Out,Start Election Term [14]
+2023/09/15 18:15:20.413353 [1] Time Out,Start Election Term [15]
+2023/09/15 18:15:20.413558 [2] Time Out,Start Election Term [15]
+2023/09/15 18:15:20.414091 [3] Vote To [1] In term [15]
+2023/09/15 18:15:20.414073 [0] Vote To [2] In term [15]
+2023/09/15 18:15:20.514419 [5] Time Out,Start Election Term [15]
+2023/09/15 18:15:20.816345 [1] Time Out,Start Election Term [16]
+2023/09/15 18:15:20.816657 [3] Time Out,Start Election Term [16]
+2023/09/15 18:15:20.816823 [0] Time Out,Start Election Term [16]
+2023/09/15 18:15:20.819032 [2] Vote To [1] In term [16]
+2023/09/15 18:15:21.017935 [5] Time Out,Start Election Term [16]
+2023/09/15 18:15:21.218446 [1] Time Out,Start Election Term [17]
+2023/09/15 18:15:21.218512 [0] Time Out,Start Election Term [17]
+2023/09/15 18:15:21.218845 [2] Time Out,Start Election Term [17]
+2023/09/15 18:15:21.219796 [3] Vote To [1] In term [17]
+2023/09/15 18:15:21.419438 [5] Time Out,Start Election Term [17]
+2023/09/15 18:15:21.620428 [0] Time Out,Start Election Term [18]
+2023/09/15 18:15:21.620592 [2] Time Out,Start Election Term [18]
+2023/09/15 18:15:21.620687 [3] Time Out,Start Election Term [18]
+2023/09/15 18:15:21.622159 [1] Vote To [0] In term [18]
+2023/09/15 18:15:21.821781 [5] Time Out,Start Election Term [18]
+--- FAIL: TestManyElections2A (8.43s)
+    config.go:398: expected one leader, got none
+```
+
+这次是0，1，2，3必须投票给同一个Server。
+
+然后发现了一些不对的地方
+
+```tex
+2023/09/15 18:15:20.011701 [1] Time Out,Start Election Term [14]
+2023/09/15 18:15:20.011758 [2] Vote To [0] In term [14]
+
+2023/09/15 18:15:20.413353 [1] Time Out,Start Election Term [15]
+2023/09/15 18:15:20.413558 [2] Time Out,Start Election Term [15]
+```
+
+可以看到，1的超时选举时间重设为了401.652ms,2的超时选举时间重设为了401.800ms,两者太相近了。只要这种情况发生，就会出现一直分票的情况。这大概是不够随机的原因，300-500ms的超时间隔太近了。然后我尝试将超时时间在$[300,900]ms$ ，解决了这个问题
+
+最后，使用`go test -run TestManyElections2A -race -count 100 -timeout 1800s `，运行100次测试。
+
+![image-20230915200039030](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230915200039030.png)
