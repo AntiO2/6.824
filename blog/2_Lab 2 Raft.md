@@ -96,11 +96,7 @@ labrpc模拟了可能丢包、延迟的网络环境。
 
 其中，通过阅读`Persister`代码，其中有序列化和反序列化方法。
 
-## 基础数据结构
-
-
-
-## Lab2a实现
+## 0x31 Lab2a实现
 
 目标：实现Leader选举。不需要携带log(空append entry)
 
@@ -601,3 +597,366 @@ Debug时遇到的坑：
 最后，使用`go test -run TestManyElections2A -race -count 100 -timeout 1800s `，运行100次测试。
 
 ![image-20230915200039030](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230915200039030.png)
+
+## 0x32 Lab2B
+
+### 初步实现
+
+**注意** ： 这一小节的代码还没有debug，是笔记。具体修改后的看下一小节
+
+> Start by implementing `Start()`, then write the code to send and receive new log entries via `AppendEntries` RPCs, following Figure 2.
+
+首先实现`Start()`函数
+
+> the service using Raft (e.g. a k/v server) wants to start
+> agreement on the next Command to be appended to Raft's log. if this
+> server isn't the leader, returns false. otherwise start the
+> agreement and return immediately. there is no guarantee that this
+> Command will ever be committed to the Raft log, since the leader
+> may fail or lose an election. even if the Raft instance has been killed,
+> this function should return gracefully.
+>
+> the first return value is the Index that the Command will appear at
+> if it's ever committed. the second return value is the current
+> Term. the third return value is true if this server believes it is
+> the leader.
+
+如果该server不是leader，直接返回`false`。
+
+```go
+index := -1
+
+// Your code here (2B).
+term, isLeader := rf.GetState()
+if !isLeader {
+    return index, term, isLeader
+}
+```
+
+如果该Server是Leader，直接返回Index。将新的Command作为Log写入logs中。该条log等待下一次心跳统一发送（一次发送多条）
+
+```go
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+    var index indexT = -1
+    // Your code here (2B).
+    term, isLeader := rf.GetState()
+    if !isLeader {
+       return int(index), term, isLeader
+    }
+    index = rf.getLastLogIndex() + 1
+    rf.logs = append(rf.logs, Log{
+       Term:    termT(term),
+       Index:   index,
+       Command: command,
+    })
+    rf.persist()
+    rf.appendEntries(false)
+    return int(index), term, isLeader
+}
+```
+
+接下来要做的就是修改AppendEntry的逻辑（实现figure2）
+
+> Receiver implementation:
+>
+> 1. Reply false if term < currentTerm (§5.1)
+> 2. Reply false if log doesn’t contain an entry at prevLogIndex
+>
+> whose term matches prevLogTerm (§5.3)
+>
+> 3. If an existing entry conflicts with a new one (same index
+>
+> but different terms), delete the existing entry and all that
+>
+> follow it (§5.3)
+>
+> 4. Append any new entries not already in the log
+> 5. If leaderCommit > commitIndex, set commitIndex =
+>
+> min(leaderCommit, index of last new entry)
+
+其中
+
+1. 选举就已经实现
+
+```go
+reply.Success = false
+reply.Term = rf.currentTerm
+if args.Term < rf.currentTerm {
+    return
+}
+```
+
+2. *Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)*
+
+​	注意，要先找到相同Index的位置（这里数组不能越界），并且该位置的Log应该具有相同的term
+
+```go
+reply.Success = false
+if args.PrevLogIndex > rf.getLastLogIndex() {
+    return
+}
+rf.logLatch.RLock()
+if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+    rf.logLatch.RUnlock()
+    return
+}
+```
+
+3. *If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it (§5.3)*。
+
+这句话我一开始没理解到，same index but different terms的情况不是在2里面就被return了吗？其实是，当prevLog匹配上了，就可以开始做Log Replication，在这个过程中，可能后面的log存在term冲突的情况，这个时候覆盖就行了。
+
+4. >  Append any new entries not already in the log
+
+实现3和4：
+
+```go
+rf.logLatch.Lock()
+defer rf.logLatch.Unlock()
+rf.logs = append(rf.logs[args.PrevLogIndex:], args.Entries...)
+reply.Success = true
+```
+
+5. If leaderCommit > commitIndex, set commitIndex =min(leaderCommit, index of last new entry)
+
+```go
+if args.LeaderCommit > rf.commitIndex {
+    rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
+    rf.apply()
+}
+```
+
+以上是follower的逻辑。
+
+
+
+接下来应当修改Leader发送RPC的逻辑
+
+首先根据`nextIndex`找到prevLOg,获取请求参数。
+
+```go
+for i := range rf.peers {
+    if i != rf.me && (heartBeat || lastIndex >= rf.nextIndex[i]) {
+       prevLog := &rf.logs[rf.nextIndex[i]]
+       args := appendEntryArgs{
+          Term:         rf.currentTerm,
+          LeaderId:     rf.me,
+          PrevLogIndex: prevLog.Index,
+          PrevLogTerm:  prevLog.Term,
+          LeaderCommit: rf.commitIndex,
+       }
+       copy(args.Entries, rf.logs[rf.nextIndex[i]:])
+```
+
+然后发送RPC
+
+```go
+go func(rf *Raft, args *appendEntryArgs, peerId int) {
+    client := rf.peers[peerId]
+    var reply appendEntryReply
+    client.Call("Raft.AppendEntriesRPC", args, &reply)
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if reply.Term > rf.currentTerm {
+       rf.setTerm(reply.Term)
+       rf.setElectionTime()
+       rf.status = follower
+       return
+    }
+    if !reply.Success {
+       rf.nextIndex[i]--
+    } else {
+       rf.matchIndex[i] = rf.nextIndex[i]
+    }
+}(rf, &args, i)
+```
+
+接下来，检查是否有新的Log可以转为提交状态
+
+> If there exists an N such that N > commitIndex, a majority
+>
+> of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+>
+> set commitIndex = N (§5.3, §5.4).
+
+
+
+```go
+func (rf *Raft) checkCommit() {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if rf.status != leader {
+       return
+    }
+    lastIndex := rf.getLastLogIndex()
+    rf.logLatch.RLock()
+    defer rf.logLatch.RUnlock()
+    for i := rf.commitIndex; i <= lastIndex; i++ {
+       if rf.logs[i].Term != rf.currentTerm {
+          // 5.4.2 Committing entries from previous terms
+          continue
+       }
+       count := 0
+       for j := 0; j < rf.peerNum; j++ {
+          if j == rf.me {
+             count++
+          } else {
+             if rf.matchIndex[j] >= i {
+                count++
+             }
+          }
+       }
+       if count > rf.peerNum/2 {
+          rf.commitIndex = i
+          rf.apply()
+       }
+    }
+}
+```
+
+
+
+实现Apply。这里有提示：
+
+> Your code may have loops that repeatedly check for certain events. Don't have these loops execute continuously without pausing, since that will slow your implementation enough that it fails tests. Use Go's [condition variables](https://golang.org/pkg/sync/#Cond), or insert a `time.Sleep(10 * time.Millisecond)` in each loop iteration.
+
+使用条件变量。
+
+### debug-lab2a
+
+
+
+然后是让人心碎的测试环节。
+
+```sh
+go test -run TestBasicAgree2B -race -count 5 
+go test -run TestRPCBytes2B -race -count 5
+go test -run TestFailAgree2B -race -count 5
+go test -run TestFailNoAgree2B -race -count 5
+go test -run TestConcurrentStarts2B -race -count 5
+go test -run TestRejoin2B -race -count 5
+go test -run TestBackup2B -race -count 5
+go test -run TestCount2B -race -count 5
+```
+
+
+
+
+
+1. Go语言copy的使用。
+
+在复制切片时，args.entries一直是nil
+
+查找资料才知道，dst必须能够有足够大的容量复制进去
+
+也就是说，要初始化`Entries: make([]Log, lastIndex - rf.nextIndex[i] + 1)`
+
+> ref：[Go语言copy()：切片复制（切片拷贝） (biancheng.net)](http://c.biancheng.net/view/29.html)
+
+2. 发现Follower一直在添加log
+
+原因：忘记在成功时更新NextIndex
+
+```go
+rf.nextIndex[i] = rf.nextIndex[i] + indexT(len(args.Entries))
+```
+
+3. 发现logs变更错误
+
+```go
+rf.logs = append(rf.logs[args.PrevLogIndex:], args.Entries...)
+```
+
+这里逻辑有问题，应该是截取从[0,PrevLogIndex+1)
+
+4. ![image-20230916233749597](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230916233749597.png)
+
+在之前的Leader挂掉之后，出现一直append 的情况，是因为服务器在变为Leader之后没有更新好matchIndex和nextIndex的原因
+
+5. 无限循环？
+
+之前CheckCommit中
+
+循环是从rf.commitIndex开始的，莫名其妙会卡住
+
+```go
+for i := rf.commitIndex; i <= lastIndex; i++ {
+```
+
+改成
+
+```go
+for i := rf.commitIndex + 1;i <= lastIndex; i++ {
+```
+
+就不卡了。
+
+后来检查到，是发生了死锁。
+
+因为我的apply逻辑是：
+
+服务器启动时，启动一个go程doApply()，负责apply command
+
+```go
+func (rf *Raft) apply() {
+	rf.applySign <- true
+}
+func (rf *Raft) doApply() {
+
+    for !rf.killed() {
+       <-rf.applySign
+        rf.mu.Lock()
+        ...
+```
+
+在CheckCommit中，首先获取了`rf.mu.Lock()`。所以导致了死锁
+
+6. 应该能够支持RPC的并发发送。注意不要把Call都放在临界区里面
+
+7. 注意添加Log时，要保证Index的正确性，之前并发加锁策略出错，在这里错了。
+
+8. 还有一个需要讨论的：就是Leader在添加一条log，需要立即发送RPC吗？
+
+我在之前，是收到一条log就立即发送RPC。但是在测试中，才意识到会发送如下情景的问题：
+
+假如Leader在2ms内收到了100条log，如果采用立即触发的方式，就会导致发送100*follower数量的RPC，分别携带`1~1,1~2,1~3,1~4...1~100`的log。因为leader在发送RPC之后，不会立即收到follower的回复。而follower收到的RPC实际上是很冗余的。比如收到$1\sim 50$ 的logs，下一条收到的$1\sim 100$ 的logs，会重复copy前50条。
+
+9. 之前follower的
+
+```go
+rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+```
+
+实际上违反了leader规则4
+
+> Append any new entries not already in the log
+
+接第8条，比如先收到$1\sim 100$的RPC,再收到$1\sim 50$的RPC。 虽然即使这样，Leader会在几个RPC之后进行回退重传，但还是违反了规则，因为都是Term1的Index(注意：相同term并且相同index的log一定相同)，所以后面的RPC即使没有冲突也并不会更新Logs
+
+重写append逻辑，使其符合规则4
+
+```go
+	rf.logLatch.Lock()
+	if args.Entries != nil && len(args.Entries) != 0 {
+		rf.logger.Printf("[%d] append [%d] logs\nprev rf's logs: [%v]\nnew logs: [%v]", rf.me, len(args.Entries), rf.logs, args.Entries)
+	}
+	for i, entry := range args.Entries {
+		if int(entry.Index) < len(rf.logs) && entry.Term != rf.logs[entry.Index].Term {
+			// conflict
+			rf.logs = append(rf.logs[:entry.Index], entry)
+			rf.persist()
+		}
+		if entry.Index >= indexT(len(rf.logs)) {
+			// Append any new entries not already in the log
+			rf.logs = append(rf.logs, args.Entries[i:]...)
+			break
+		}
+	}
+	if args.Entries != nil && len(args.Entries) != 0 {
+		rf.logger.Printf("[%d] append [%d] logs\nrf's logs: [%v]\nnew logs: [%v]", rf.me, len(args.Entries), rf.logs, args.Entries)
+	}
+	rf.persist()
+	rf.logLatch.Unlock()
+```
+
