@@ -604,6 +604,12 @@ Debug时遇到的坑：
 
 **注意** ： 这一小节的代码还没有debug，是笔记。具体修改后的看下一小节
 
+lab2b通过测试的代码：[feat(raft) lab2b · AntiO2/6.824@d969343 (github.com)](https://github.com/AntiO2/6.824/commit/d969343dadf3aeb8c167cf36bc600e0b0b1e01ec)
+
+
+
+
+
 > Start by implementing `Start()`, then write the code to send and receive new log entries via `AppendEntries` RPCs, following Figure 2.
 
 首先实现`Start()`函数

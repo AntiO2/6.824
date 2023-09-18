@@ -311,13 +311,14 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // Term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.logger.Printf("Leader [%d] Receive Log [%v]\n", rf.me, command)
+
 	var index indexT = -1
 	// Your code here (2B).
 	term, isLeader := rf.GetState()
 	if !isLeader {
 		return int(index), term, isLeader
 	}
+	rf.logger.Printf("Leader [%d] Receive Log [%v]\n", rf.me, command)
 	rf.logLatch.Lock()
 	if len(rf.logs) == 0 {
 		index = 0
@@ -480,6 +481,13 @@ func (rf *Raft) getLastLogIndex() indexT {
 		return rf.logs[len(rf.logs)-1].Index
 	}
 }
+func (rf *Raft) getLastLogIndexWriteMode() indexT {
+	if len(rf.logs) == 0 {
+		return 0
+	} else {
+		return rf.logs[len(rf.logs)-1].Index
+	}
+}
 
 // getLastLogIndex returns the last Term of logs
 func (rf *Raft) getLastLogTerm() termT {
@@ -528,7 +536,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 				if len(args.Entries) > 0 {
 					rf.logger.Printf("[%d] Send AppendRPC To [%d]\n[%s]\nLogs: [%v]", rf.me, peerId, args.String(), args.Entries)
 				} else {
-					rf.logger.Printf("[%d] Send Heartbeat To [%d]\n[%s]\n", rf.me, peerId, args.String())
+					// rf.logger.Printf("[%d] Send Heartbeat To [%d]\n[%s]\n", rf.me, peerId, args.String())
 				}
 				rf.mu.Unlock()
 				client.Call("Raft.AppendEntriesRPC", args, &reply)
@@ -548,8 +556,8 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 				if reply.Conflict {
 					rf.nextIndex[peerId]--
 				} else if reply.Success && len(args.Entries) > 0 {
-					rf.matchIndex[peerId] = args.PrevLogIndex + indexT(len(args.Entries))
-					rf.nextIndex[peerId] = rf.matchIndex[peerId] + 1
+					rf.matchIndex[peerId] = max(args.PrevLogIndex+indexT(len(args.Entries)), rf.matchIndex[peerId])
+					rf.nextIndex[peerId] = max(rf.nextIndex[peerId], rf.matchIndex[peerId]+1)
 					rf.logger.Printf("Leader[%d] NextIndex Of [%d] Update To [%d]\n", rf.me, peerId, rf.nextIndex[peerId])
 					go rf.checkCommit()
 				}
@@ -619,12 +627,12 @@ func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply)
 		rf.logger.Printf("[%d] append [%d] logs\nprev rf's logs: [%v]\nnew logs: [%v]", rf.me, len(args.Entries), rf.logs, args.Entries)
 	}
 	for i, entry := range args.Entries {
-		if int(entry.Index) < len(rf.logs) && entry.Term != rf.logs[entry.Index].Term {
+		if entry.Index <= rf.getLastLogIndexWriteMode() && entry.Term != rf.logs[entry.Index].Term {
 			// conflict
 			rf.logs = append(rf.logs[:entry.Index], entry)
 			rf.persist()
 		}
-		if entry.Index >= indexT(len(rf.logs)) {
+		if entry.Index > rf.getLastLogIndexWriteMode() {
 			// Append any new entries not already in the log
 			rf.logs = append(rf.logs, args.Entries[i:]...)
 			break
