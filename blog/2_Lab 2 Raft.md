@@ -604,7 +604,7 @@ Debug时遇到的坑：
 
 **注意** ： 这一小节的代码还没有debug，是笔记。具体修改后的看下一小节
 
-lab2b通过测试的代码：[feat(raft) lab2b · AntiO2/6.824@d969343 (github.com)](https://github.com/AntiO2/6.824/commit/d969343dadf3aeb8c167cf36bc600e0b0b1e01ec)
+lab2b通过测试的代码：[[6.824/src/raft/raft.go at 5f1e191a4c18751527122c289e4a0549261f04b6 · AntiO2/6.824 (github.com)](https://github.com/AntiO2/6.824/blob/5f1e191a4c18751527122c289e4a0549261f04b6/src/raft/raft.go)](https://github.com/AntiO2/6.824/commit/d969343dadf3aeb8c167cf36bc600e0b0b1e01ec)
 
 
 
@@ -643,21 +643,31 @@ if !isLeader {
 
 ```go
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-    var index indexT = -1
-    // Your code here (2B).
-    term, isLeader := rf.GetState()
-    if !isLeader {
-       return int(index), term, isLeader
-    }
-    index = rf.getLastLogIndex() + 1
-    rf.logs = append(rf.logs, Log{
-       Term:    termT(term),
-       Index:   index,
-       Command: command,
-    })
-    rf.persist()
-    rf.appendEntries(false)
-    return int(index), term, isLeader
+
+	var index indexT = -1
+	// Your code here (2B).
+	term, isLeader := rf.GetState()
+	if !isLeader {
+		return int(index), term, isLeader
+	}
+	rf.logger.Printf("Leader [%d] Receive Log [%v]\n", rf.me, command)
+	rf.logLatch.Lock()
+	if len(rf.logs) == 0 {
+		index = 0
+	} else {
+		index = rf.logs[len(rf.logs)-1].Index
+	}
+	index++
+	rf.logs = append(rf.logs, Log{
+		Term:    termT(term),
+		Index:   index,
+		Command: command,
+	})
+	rf.persist()
+	// rf.logger.Printf("Leader [%d] \nLog [%v]\n", rf.me, rf.logs)
+	rf.logLatch.Unlock()
+	// rf.appendEntries(false)
+	return int(index), term, isLeader
 }
 ```
 
@@ -715,7 +725,7 @@ if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 
 4. >  Append any new entries not already in the log
 
-实现3和4：
+实现3和4(这里是错误的想法，具体修改看下一小节)：
 
 ```go
 rf.logLatch.Lock()
@@ -729,7 +739,7 @@ reply.Success = true
 ```go
 if args.LeaderCommit > rf.commitIndex {
     rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
-    rf.apply()
+    go rf.apply()
 }
 ```
 
@@ -948,12 +958,12 @@ rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 		rf.logger.Printf("[%d] append [%d] logs\nprev rf's logs: [%v]\nnew logs: [%v]", rf.me, len(args.Entries), rf.logs, args.Entries)
 	}
 	for i, entry := range args.Entries {
-		if int(entry.Index) < len(rf.logs) && entry.Term != rf.logs[entry.Index].Term {
+		if entry.Index <= rf.getLastLogIndexWriteMode() && entry.Term != rf.logs[entry.Index].Term {
 			// conflict
 			rf.logs = append(rf.logs[:entry.Index], entry)
 			rf.persist()
 		}
-		if entry.Index >= indexT(len(rf.logs)) {
+		if entry.Index > rf.getLastLogIndexWriteMode() {
 			// Append any new entries not already in the log
 			rf.logs = append(rf.logs, args.Entries[i:]...)
 			break
@@ -966,3 +976,198 @@ rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 	rf.logLatch.Unlock()
 ```
 
+10. 一个需要注意的点：logs的长度并不等于最后一条log的index！即使我们一开始会观察到是这样（因为我的实现中第0条log永远是一个空log）。因为之后会清除掉不需要的log，所以这条经验不成立。
+
+
+
+## 0x33 Lab2C
+
+### 实现Persister
+
+> Your implementation won't use the disk; instead, it will save and restore persistent state from a `Persister` object (see `persister.go`).
+
+就是把Raft服务器的状态通过Persister持久化（而非直接写在磁盘上）。
+
+> Complete the functions `persist()` and `readPersist()` in `raft.go` by adding code to save and restore persistent state. You will need to encode (or "serialize") the state as an array of bytes in order to pass it to the `Persister`. Use the `labgob` encoder; see the comments in `persist()` and `readPersist()`. `labgob` is like Go's `gob` encoder but prints error messages if you try to encode structures with lower-case field names.
+
+说实话，就是将Figure2中指明需要持久化的数据进行序列化和反序列化的操作。
+
+![image-20230918213352819](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230918213352819.png)
+
+```go
+func (rf *Raft) persist() {
+    // Your code here (2C).
+    // Example:
+    w := new(bytes.Buffer)
+    e := labgob.NewEncoder(w)
+    err := e.Encode(rf.currentTerm)
+    if err != nil {
+       return
+    }
+    err = e.Encode(rf.votedFor)
+    if err != nil {
+       return
+    }
+    err = e.Encode(rf.logs)
+    if err != nil {
+       return
+    }
+    rf.persister.SaveRaftState(w.Bytes())
+}
+
+// restore previously persisted state.
+func (rf *Raft) readPersist(data []byte) {
+    if data == nil || len(data) < 1 { // bootstrap without any state?
+       return
+    }
+    // Your code here (2C).
+    // Example:
+    r := bytes.NewBuffer(data)
+    d := labgob.NewDecoder(r)
+    var currentTerm termT
+    var votedFor int
+    var logs []Log
+    if d.Decode(&currentTerm) != nil ||
+       d.Decode(&votedFor) != nil ||
+       d.Decode(&logs) != nil {
+       log.Fatalln("Error Occur When Deserialize Raft State")
+    } else {
+       rf.currentTerm = currentTerm
+       rf.votedFor = votedFor
+       rf.logs = logs
+    }
+}
+```
+
+做了这个之后，并且注意在每次需要持久化的状态改变时都使用`rf.persist()`进行持久化，前两个测试点应该就可以通过了。
+
+接下来的目标是对同步进行优化：
+
+因为我目前是每50ms发送一次心跳，假设一个follower落后100条log,每次回退一条nextIndex的话，需要100次心跳才能同步。
+
+![image-20230919142710891](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230919142710891.png)
+
+S2当选Leader后，发送心跳给S1,prevLogIndex=5,prevLogTerm=6。S1发现了Term冲突，于是XTerm=5(冲突的Term编号)，XIndex=2(该冲突Term的第一个Index)返回给S2,S2快速回退。
+
+这里参考笔记：[7.3 快速恢复（Fast Backup） - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/203483680)
+
+> - XTerm：这个是Follower中与Leader冲突的Log对应的任期号。在之前（7.1）有介绍Leader会在prevLogTerm中带上本地Log记录中，前一条Log的任期号。如果Follower在对应位置的任期号不匹配，它会拒绝Leader的AppendEntries消息，并将自己的任期号放在XTerm中。如果Follower在对应位置没有Log，那么这里会返回 -1。
+> - XIndex：这个是Follower中，对应任期号为XTerm的第一条Log条目的槽位号。
+> - XLen：如果Follower在对应位置没有Log，那么XTerm会返回-1，XLen表示空白的Log槽位数。
+
+这里我理解的XLen是follower当前的`len(rf.logs)`
+
+那么follower在接收logs信息有如下的状态：
+
+1. pTerm和pIndex匹配：说明不用回退，可以直接增加（或覆盖）logs
+2. pIndex > 当前logs的长度。返回XLen = len(rf.logs
+
+```go
+if args.PrevLogIndex > lastIndex {
+    rf.logger.Printf("[%d] receive beyond conflict logs", rf.me)
+    reply.Conflict = true
+    reply.XTerm = -1
+    reply.XLen = len(rf.logs)
+    rf.logLatch.RUnlock()
+    return
+}
+```
+
+3. pTerm不匹配，返回XTerm = follower发生冲突的Term，XIndex = follower上该Term第一条log的Index
+
+```go
+	if rf.getIthIndex(args.PrevLogIndex).Term != args.PrevLogTerm {
+		rf.logger.Printf("[%d] receive prev term conflict logs", rf.me)
+		reply.Conflict = true
+		reply.XTerm = rf.getIthIndex(args.PrevLogIndex).Term
+		reply.XIndex = rf.getFirstLogIndexInXTerm(reply.XTerm, args.PrevLogIndex)
+		rf.logLatch.RUnlock()
+		return
+	}
+
+...
+
+func (rf *Raft) getFirstLogIndexInXTerm(xTerm termT, prevIndex indexT) indexT {
+	// rf.logger.Printf("In Get FirstLogIndexInXTerm\nS[%d]\nlogs: %v", rf.me, rf.logs)
+	idx := min(prevIndex, rf.getLastLogIndexLockFreeMode())
+	if rf.getIthIndex(idx).Term != xTerm {
+		log.Fatalln("Error Use getFirstLogIndexInXTerm") // 初始状态下，logs[idx]一定等于xTerm
+	}
+	for int(idx)+rf.logOffset > 0 {
+		if rf.getIthIndex(idx-1).Term != xTerm {
+			break
+		}
+		idx--
+	}
+	return idx
+}
+
+```
+
+
+
+当Leader接收到RPC的Reply时，做以下处理
+
+1. 若Success==true,更新NextIndex
+
+2. 若发生冲突
+
+   - 若XTerm=-1,说明follower的logs比较短，将NextIndex设为XLen
+
+   - 若XTerm!=-1, 这个时候需要找到leader在XTerm中最后一条log
+
+     - 若没有找到该log
+
+     比如这种情况，XTerm=5,需要将nextIndex回退到XIndex(2)的位置
+
+     ![image-20230919151757424](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogblogimage-20230919151757424.png)
+
+     - 若Leader有部分Term=5的log
+
+     ![image-20230919152045101](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230919152045101.png)
+
+     此时Leader找到自己最后一个在XTerm的位置为3，也就是说，在3之前（index相同并且term相同）的logs都是完全相同的，可以将nextIndex移到4这个位置。
+
+```go
+if reply.Conflict {
+					if reply.XTerm != -1 {
+						lastIndexInXTerm := rf.getLastLogIndexInXTerm(reply.XTerm, int(reply.XIndex))
+						rf.logger.Printf("Leader[%d] Logs:[\n%v]\n LastIndex In X Term: %d", rf.me, rf.logs, lastIndexInXTerm)
+						rf.logger.Println("Term Conflict")
+						if lastIndexInXTerm == -1 {
+							rf.nextIndex[peerId] = reply.XIndex
+						} else {
+							rf.nextIndex[peerId] = indexT(lastIndexInXTerm + 1)
+						}
+					} else {
+						rf.logger.Println("Follower Too Short")
+						rf.logger.Printf("Leader[%d] XLen: %d\n", rf.me, reply.XLen)
+						rf.nextIndex[peerId] = indexT(reply.XLen)
+					}
+					rf.logger.Printf("Leader[%d] NextIndex Of [%d] Update To [%d]\n", rf.me, peerId, rf.nextIndex[peerId])
+				} else if reply.Success && len(args.Entries) > 0 {
+					rf.logger.Println("Success Update")
+					rf.matchIndex[peerId] = max(args.PrevLogIndex+indexT(len(args.Entries)), rf.matchIndex[peerId])
+					rf.nextIndex[peerId] = max(rf.nextIndex[peerId], rf.matchIndex[peerId]+1)
+					rf.logger.Printf("Leader[%d] NextIndex Of [%d] Update To [%d]\n", rf.me, peerId, rf.nextIndex[peerId])
+					go rf.checkCommit()
+				}
+
+...
+// getLastLogIndexInXTerm 返回rf.logs在xTerm中最后一条log的下标
+// 如果完全没有xTerm,返回-1
+func (rf *Raft) getLastLogIndexInXTerm(xTerm termT, xIndex int) int {
+	idx := rf.logOffset + xIndex
+	if rf.logs[idx].Term != xTerm {
+		return -1
+	}
+	for idx < len(rf.logs)-1 {
+		if rf.logs[idx+1].Term != xTerm {
+			return idx
+		}
+		idx++
+	}
+	return idx
+}
+
+```
