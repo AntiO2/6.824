@@ -32,7 +32,17 @@ Raft协议感觉目标很简单：保证分布式系统的一致性和可用性�
 
 3. 如何保证term不重复？
 
+每当一个server收到的RPC（接收或者回复得到的消息），观察到了一个更新的Term，都会立即进入follower状态并更新状态。即使出现网络分区，也不会出现相同的term，却出现相同Index的Log不同的情况。试想：要出现一个Leader，大多数的s都会进入最新的Term，接下来有两种情况：大多数中的一个当选，此时的currentTerm已经大于Term。
 
+第二种情况，也就是我担心的。
+
+![70CAF0083930B67F78D016635098C259](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blog70CAF0083930B67F78D016635098C259.jpg)
+
+S1在Term2当选Leader,S2已经观察到Term2，S3短暂不能接收RPC。并且S1收到一条Log但还没有来得及传给S2和S3。此时S3 Timeout开始选举，增加自己的Term为2，若S3赢得选举，再收到一条log。
+
+此时问题来了：S1和S3都有Term=2，Index=2的log，但是两条Log却是内容不一样的！违反了安全性。
+
+为了解决这个问题，我认为应该candidateTerm<=currentTerm，都返回false,而不是只有candidateTerm < currentTerm时返回false
 
 ## 0x12 一些细节
 
@@ -598,6 +608,28 @@ Debug时遇到的坑：
 
 ![image-20230915200039030](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230915200039030.png)
 
+
+
+---
+
+**补充说明：** 在Leader当选之后，应当立即增加一条空记录。
+
+比如
+
+```go
+rf.logLatch.Lock()
+rf.logs = append(rf.logs, Log{
+    Term:    rf.currentTerm,
+    Index:   nextIndex,
+    Command: nil,
+})
+rf.persist()
+// rf.logger.Printf("Leader [%d] \nLog [%v]\n", rf.me, rf.logs)
+rf.logLatch.Unlock()
+```
+
+但是Lab2B的代码逻辑会检测Index值，第一条Log的Index必须为1而不是2。导致通过不了测试。
+
 ## 0x32 Lab2B
 
 ### 初步实现
@@ -1041,6 +1073,8 @@ func (rf *Raft) readPersist(data []byte) {
 
 做了这个之后，并且注意在每次需要持久化的状态改变时都使用`rf.persist()`进行持久化，前两个测试点应该就可以通过了。
 
+### Fast Rollback
+
 接下来的目标是对同步进行优化：
 
 因为我目前是每50ms发送一次心跳，假设一个follower落后100条log,每次回退一条nextIndex的话，需要100次心跳才能同步。
@@ -1171,3 +1205,191 @@ func (rf *Raft) getLastLogIndexInXTerm(xTerm termT, xIndex int) int {
 }
 
 ```
+
+## 0x34 Lab2D log compaction
+
+实现快照。其实类似Checkpoint,要求Server持久化已有Log的状态，然后只需要通过snapshot就能恢复，不用一个一个Log再来redo。
+
+Leader并不是通过计算去判断是否发送快照，而是通过判断当前的Next去发送Snapshot。比如一个Leader有了1-10000的Log，然后制作了快照，此时Logs中有10001—20000的Logs。此时一台包含1-5000的服务器启动了，然后收到了Leader的append entry rpc, 然后在之前的逻辑中，follower的logs较短，会回复Xlen=5000,这里需要做点改动，应当发送follower最后包含的Index。Leader接收到RPC回复，发现NextIndex应当回退到Index=5000, 但是，Leader中前1w的Log都被清理掉了，这个时候就需要发送快照安装的RPC。
+
+![image-20230920201413103](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230920201413103.png)
+
+在Follower接收到相应的快照，进行安装。并且丢弃掉自己的所有Logs。
+
+如果Follower接收到快照，并且在快照之后还有Log，会保留之后的Logs, 我有点没有想通为什么会发生这种情况。按理说根据快速回退，是因为Follower没有之前的Log才会接收到snapshot,但是现在又出现了快照之后的log.
+
+要注意，当CommitIndex > Snapshot.LastIndex，就不能再安装该快照了，因为状态机已经应用了快照之后的Log，如果此时安装快照会发生覆盖。
+
+
+
+---
+
+接下来是代码部分，首先实现Snapshot。注意，比如按照一个KV数据库，通过Apply信息，得到了x,0;y,9这两个键值对，而RAFT本身是不需要通过Log构建状态机的信息的。snapshot是service提供的，我们是不需要去生成snapshot的，用就好了。
+
+```go
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	// Your code here (2D).
+	idx := indexT(index)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.logLatch.Lock()
+	defer rf.logLatch.Unlock()
+	if idx <= rf.getLastIncludeIndex() {
+		rf.logger.Println("Outdated Snapshot")
+		return
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	for i, l := range rf.logs {
+		if l.Index == idx {
+			tmpLogs := make([]Log, 1)
+			tmpLogs[0] = Log{
+				Term:    l.Term,
+				Index:   idx,
+				Command: nil,
+			}
+			rf.logs = append(tmpLogs, rf.logs[i+1:]...)
+		}
+	}
+
+	if e.Encode(rf.currentTerm) != nil ||
+		e.Encode(rf.votedFor) != nil ||
+		e.Encode(rf.logs) != nil {
+		rf.logger.Fatalln("Error When Encode State")
+	}
+	rf.persister.SaveStateAndSnapshot(w.Bytes(), snapshot)
+}
+```
+
+---
+
+**RPC部分：**
+
+1. 首先根据Figure13,创建参数
+
+```go
+type InstallSnapshotArgs struct {
+	Term              termT
+	LeaderId          int
+	LastIncludedIndex indexT
+	LastIncludedTerm  termT
+	// offset int
+	Data []byte
+	// done bool
+}
+type InstallSnapshotReply struct {
+	Term termT
+}
+```
+
+注意在Lab中进行了简化，一次性发送所有快照。
+
+2. follower接收快照，注意此时还没有安装。因为安装操作是状态机在进行
+
+```go
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if args.term > rf.currentTerm {
+       rf.setTerm(args.term)
+       rf.status = follower
+    }
+    reply.term = rf.currentTerm
+    if args.term < rf.currentTerm || args.lastIncludedTerm <= rf.getLastIncludeTerm() {
+       return
+    }
+    rf.applyCh <- ApplyMsg{
+       CommandValid:  false,
+       Command:       nil,
+       CommandIndex:  -1,
+       SnapshotValid: true,
+       Snapshot:      args.data,
+       SnapshotTerm:  int(args.lastIncludedTerm),
+       SnapshotIndex: int(args.lastIncludedIndex),
+    }
+}
+```
+
+等待安装快照完成后，RAFT需要更新信息，此时需要调用CondInstallSnapshot来更新RAFT的信息。
+
+
+
+```go
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+
+    // Your code here (2D).
+    lastIncludedIndex2 := indexT(lastIncludedIndex)
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if lastIncludedIndex2 <= rf.commitIndex {
+       return false
+    }
+    rf.logLatch.Lock()
+    defer rf.logLatch.Unlock()
+    if lastIncludedIndex2 < rf.getLastLogIndex() && rf.getLastLogTerm() == termT(lastIncludedTerm) {
+       //     If existing log entry has same index and term as snapshot’s
+       // last included entry, retain log entries following it and reply
+       rf.logs = append([]Log(nil), rf.logs[rf.getLogOffset()+lastIncludedTerm:]...)
+    } else {
+       // Discard the entire log
+       rf.logs = append([]Log(nil), Log{
+          Term:    termT(lastIncludedTerm),
+          Index:   lastIncludedIndex2,
+          Command: nil,
+       })
+    }
+    rf.snapshot = snapshot
+    rf.commitIndex = lastIncludedIndex2
+    rf.applyIndex = lastIncludedIndex2
+    rf.saveRaftStateAndSnapshot()
+    return true
+}
+```
+
+3. 接下来是Leader如何调用安装快照的RPC
+
+当`nextIndex[i]<= rf.getLastIncludeIndex()`， 也就是说leader不包含需要发送的Log时，发送快照。
+
+```go
+rf.logLatch.RLock()
+if rf.nextIndex[i] > lastIndex {
+    rf.nextIndex[i] = lastIndex + 1
+}
+if rf.nextIndex[i] <= rf.getLastIncludeIndex() {
+    rf.logLatch.RUnlock()
+    // 已经不包含需要的Log了
+    go func(rf *Raft, peerId int) {
+       // 发送快照
+       rf.mu.Lock()
+       rf.logLatch.RLock()
+       args := InstallSnapshotArgs{
+          term:              rf.currentTerm,
+          leaderId:          rf.me,
+          lastIncludedIndex: rf.getLastIncludeIndex(),
+          lastIncludedTerm:  rf.getLastLogTerm(),
+          data:              rf.snapshot,
+       }
+       rf.logLatch.RUnlock()
+       rf.mu.Unlock()
+       var reply InstallSnapshotReply
+       rf.peers[peerId].Call("Raft. InstallSnapshot", &args, &reply)
+       rf.mu.Lock()
+       defer rf.mu.Unlock()
+       if reply.term < rf.currentTerm {
+          log.Println("Receive Outdated Install Snapshot RPC reply")
+          return
+       }
+       if reply.term > rf.currentTerm {
+          rf.becomeFollower(reply.term)
+          return
+       }
+       rf.nextIndex[peerId] = args.lastIncludedIndex + 1
+       rf.matchIndex[peerId] = args.lastIncludedIndex
+    }(rf, i)
+
+    rf.mu.Unlock()
+    continue
+}
+```
+
+4. 最后就是要进行debug环节了，因为之前的logs下标都等于Index，可能会出现很多混用的情况。比如在之前检查能否commit log中，就使用下标进行了遍历。这里建议在代码中搜索使用了`rf.logs`的地方，或者通过IDE查看用法。又比如说当follower的logs太短时返回的XLen,我认为应该改成返回follower最后的Index号XIndex，然后Leader的Nextindex=XIndex+1
