@@ -1,12 +1,10 @@
 ## 0x1 Reading Paper
 
-通过[【译文】Raft协议：In Search of an Understandable Consensus Algorithm (Extended Version) 大名鼎鼎的分布式共识算法 - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/524885008)阅读完了论文。
-
 Raft协议感觉目标很简单：保证分布式系统的一致性和可用性，在阅读时，我联想到之前看的ARIES论文，感觉思维有很多共通之处，比如如何通过非易失性存储来保证持久性。但是ARIES中是单个机器崩溃导致内存内容丢失，通过硬盘上的LOGs来重做数据库，并且ABORT掉未提交的记录并写入CLR。Raft中，可能是多台机器崩溃，这个时候就要考虑在崩溃期间，其他机器增加log的操作了，因为集群不会因为少数几台机器崩溃而整体不可用。
 
 在ARIES中，通过Commit类型的记录标识一个事务的提交，只要该commit log写入，无论是否落盘，就能告诉客户端：我已经将你的操作commit(持久化)了。而在RAFT里面，在当期TERM中，Majority的机器append了这条log,就能算做已经提交了。
 
-## 0x11 一些疑问
+### 0x11 一些疑问
 
 但是在阅读时，有几个问题没有理解到：
 
@@ -44,7 +42,7 @@ S1在Term2当选Leader,S2已经观察到Term2，S3短暂不能接收RPC。并且
 
 为了解决这个问题，我认为应该candidateTerm<=currentTerm，都返回false,而不是只有candidateTerm < currentTerm时返回false
 
-## 0x12 一些细节
+### 0x12 一些细节
 
 > Make sure you reset your election timer *exactly* when Figure 2 says you should. Specifically, you should *only* restart your election timer if a) you get an `AppendEntries` RPC from the *current* leader (i.e., if the term in the `AppendEntries` arguments is outdated, you should *not* reset your timer); b) you are starting an election; or c) you *grant* a vote to another peer.
 
@@ -1288,26 +1286,35 @@ type InstallSnapshotReply struct {
 
 ```go
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-    rf.mu.Lock()
-    defer rf.mu.Unlock()
-    if args.term > rf.currentTerm {
-       rf.setTerm(args.term)
-       rf.status = follower
-    }
-    reply.term = rf.currentTerm
-    if args.term < rf.currentTerm || args.lastIncludedTerm <= rf.getLastIncludeTerm() {
-       return
-    }
-    rf.applyCh <- ApplyMsg{
-       CommandValid:  false,
-       Command:       nil,
-       CommandIndex:  -1,
-       SnapshotValid: true,
-       Snapshot:      args.data,
-       SnapshotTerm:  int(args.lastIncludedTerm),
-       SnapshotIndex: int(args.lastIncludedIndex),
-    }
+	if debug {
+		rf.logger.Printf("[%d] Receive Snapshot\n", rf.me)
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	}
+	reply.Term = rf.currentTerm
+	rf.logLatch.RLock()
+	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.getLastIncludeIndex() {
+		rf.logLatch.RUnlock()
+		return
+	}
+	rf.setElectionTime()
+	apply := ApplyMsg{
+		CommandValid:  false,
+		Command:       nil,
+		CommandIndex:  -1,
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  int(args.LastIncludedTerm),
+		SnapshotIndex: int(args.LastIncludedIndex),
+	}
+	rf.logLatch.RUnlock()
+	go func() { rf.applyCh <- apply }()
+	go rf.apply()
 }
+
 ```
 
 等待安装快照完成后，RAFT需要更新信息，此时需要调用CondInstallSnapshot来更新RAFT的信息。
@@ -1366,7 +1373,7 @@ if rf.nextIndex[i] <= rf.getLastIncludeIndex() {
           term:              rf.currentTerm,
           leaderId:          rf.me,
           lastIncludedIndex: rf.getLastIncludeIndex(),
-          lastIncludedTerm:  rf.getLastLogTerm(),
+          lastIncludedTerm:  rf.getLastIncludeTerm(),
           data:              rf.snapshot,
        }
        rf.logLatch.RUnlock()
@@ -1393,3 +1400,21 @@ if rf.nextIndex[i] <= rf.getLastIncludeIndex() {
 ```
 
 4. 最后就是要进行debug环节了，因为之前的logs下标都等于Index，可能会出现很多混用的情况。比如在之前检查能否commit log中，就使用下标进行了遍历。这里建议在代码中搜索使用了`rf.logs`的地方，或者通过IDE查看用法。又比如说当follower的logs太短时返回的XLen,我认为应该改成返回follower最后的Index号XIndex，然后Leader的Nextindex=XIndex+1
+
+## 0x4 总结
+
+总体来说，只看lecture对raft还是有些认知不到位的，就像我说我的疑问那里，还有很多不清晰的地方。但是一旦上手做了代码，就把细节的部分掰开弄清楚了。加上网上好心人写的博客很多，知乎也有各种细节问题的讨论，最终还是顺利完成了。
+
+![image-20230921235039060](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230921235039060.png)
+
+![image-20230921235000534](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20230921235000534.png)
+
+最后就是一起测试了。这里的超时选举时间都是$300\sim900ms$
+
+图一是每50ms发送一次心跳，图2是每100ms发送一次心跳。可以看到第一次的总时间较短，但CPU用时高。心跳间隔长的总时间较长，但CPU用短（因为等待时间多）。我认为具体设置就应当看情景取舍了。如果要减少网络流量，可以用较长间隔；如果要减少延迟，可以用较短间隔。
+
+---
+
+源代码可以参考
+
+[6.824/src/raft/raft.go at master · AntiO2/6.824 (github.com)](https://github.com/AntiO2/6.824/blob/master/src/raft/raft.go)

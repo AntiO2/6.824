@@ -20,6 +20,7 @@ package raft
 import (
 	"6.824/labgob"
 	"bytes"
+	"io"
 	"log"
 	rand2 "math/rand"
 	"strconv"
@@ -38,7 +39,7 @@ type indexT int
 type statusT int
 
 const (
-	debug bool = true
+	debug bool = false
 )
 const (
 	follower statusT = iota
@@ -50,7 +51,7 @@ const (
 	// config
 	minElectionTimeOut    int           = 300
 	lengthElectionTimeOut int           = 600
-	heartBeatTime         time.Duration = 50 * time.Millisecond
+	heartBeatTime         time.Duration = 75 * time.Millisecond
 )
 
 type Log struct {
@@ -183,14 +184,20 @@ func (rf *Raft) readSnapshot(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+	rf.logger.Printf("[%d]  CondInstallSnapshot LastInclude Index[%d]\n", rf.me, lastIncludedIndex)
 	lastIncludedIndex2 := indexT(lastIncludedIndex)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if lastIncludedIndex2 <= rf.commitIndex {
-		return false
-	}
+	//if lastIncludedIndex2 <= rf.commitIndex {
+	//	rf.logger.Printf("[%d] conflict when CondInstallSnapshot\nLast Include Index[%d]\tCommit Index[%d]\n", rf.me, lastIncludedIndex2, rf.commitIndex)
+	//	return false
+	//}
 	rf.logLatch.Lock()
 	defer rf.logLatch.Unlock()
+	if lastIncludedTerm == int(rf.getLastIncludeTerm()) && lastIncludedIndex == int(rf.getLastIncludeIndex()) {
+		rf.logger.Printf("replicate snapshot") // 重复安装的快照
+		return false
+	}
 	if lastIncludedIndex2 < rf.getLastLogIndex() && rf.getLastLogTerm() == termT(lastIncludedTerm) {
 		// 	If existing log entry has same index and Term as snapshot’s
 		//	last included entry, retain log entries following it and reply
@@ -227,6 +234,9 @@ type InstallSnapshotReply struct {
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	if debug {
+		rf.logger.Printf("[%d] Receive Snapshot\n", rf.me)
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term > rf.currentTerm {
@@ -234,10 +244,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	reply.Term = rf.currentTerm
 	rf.logLatch.RLock()
-	if args.Term < rf.currentTerm || args.LastIncludedTerm <= rf.getLastIncludeTerm() {
+	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.getLastIncludeIndex() {
 		rf.logLatch.RUnlock()
 		return
 	}
+	rf.setElectionTime()
 	apply := ApplyMsg{
 		CommandValid:  false,
 		Command:       nil,
@@ -248,7 +259,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: int(args.LastIncludedIndex),
 	}
 	rf.logLatch.RUnlock()
-	rf.applyCh <- apply
+	go func() { rf.applyCh <- apply }()
+	go rf.apply()
 }
 
 // Snapshot the service says it has created a snapshot that has
@@ -433,7 +445,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.logger.Printf("Leader [%d] Receive Log [%v]\n", rf.me, command)
+	if debug {
+		rf.logger.Printf("Leader [%d] Receive Log [%v]\n", rf.me, command)
+	}
 	rf.logLatch.Lock()
 	index = rf.getLastLogIndex() + 1
 	rf.logs = append(rf.logs, Log{
@@ -512,6 +526,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.logger = log.New(log.Writer(), "", log.LstdFlags|log.Lmicroseconds)
+	if !debug {
+		rf.logger.SetOutput(io.Discard)
+	}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
@@ -541,6 +558,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]indexT, rf.peerNum)
 	rf.applyCh = applyCh
 	rf.applySign = make(chan bool)
+
+	rf.commitIndex = rf.getLastIncludeIndex()
+	rf.applyIndex = rf.getLastIncludeIndex()
 	lastLogIndex := rf.getLastLogIndex()
 
 	for i := range rf.nextIndex {
@@ -623,12 +643,16 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 					// 发送快照
 					rf.mu.Lock()
 					rf.logLatch.RLock()
+
 					args := InstallSnapshotArgs{
 						Term:              rf.currentTerm,
 						LeaderId:          rf.me,
 						LastIncludedIndex: rf.getLastIncludeIndex(),
-						LastIncludedTerm:  rf.getLastLogTerm(),
+						LastIncludedTerm:  rf.getLastIncludeTerm(),
 						Data:              rf.snapshot,
+					}
+					if debug {
+						rf.logger.Printf("%d send snapshot to %d\n", rf.me, peerId)
 					}
 					rf.logLatch.RUnlock()
 					rf.mu.Unlock()
@@ -637,7 +661,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 					if reply.Term < rf.currentTerm {
-						log.Println("Receive Outdated Install Snapshot RPC reply")
+						rf.logger.Println("Receive Outdated Install Snapshot RPC reply")
 						return
 					}
 					if reply.Term > rf.currentTerm {
@@ -646,6 +670,11 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 					}
 					rf.nextIndex[peerId] = args.LastIncludedIndex + 1
 					rf.matchIndex[peerId] = args.LastIncludedIndex
+					if debug {
+						rf.logger.Printf("%d send snapshot to %d success\n", rf.me, peerId)
+						rf.logger.Printf("Leader[%d] NextIndex Of [%d] Update To [%d]\n", rf.me, peerId, rf.nextIndex[peerId])
+					}
+
 				}(rf, i)
 				rf.mu.Unlock()
 				continue
@@ -701,8 +730,10 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 				if reply.Conflict {
 					if reply.XTerm != -1 {
 						lastIndexInXTerm := rf.getLastLogIndexInXTerm(reply.XTerm, int(reply.XIndex))
-						rf.logger.Printf("Leader[%d] Logs:[\n%v]\n LastIndex In X Term: %d", rf.me, rf.logs, lastIndexInXTerm)
-						rf.logger.Println("Term Conflict")
+						if debug {
+							rf.logger.Printf("Leader[%d] Logs:[\n%v]\n LastIndex In X Term: %d", rf.me, rf.logs, lastIndexInXTerm)
+							rf.logger.Println("Term Conflict")
+						}
 						if lastIndexInXTerm == -1 {
 							rf.nextIndex[peerId] = reply.XIndex
 						} else {
@@ -771,7 +802,9 @@ func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply)
 	lastIndex := rf.getLastLogIndex()
 	// rf.logger.Printf("[%d] Receive Append Entry \nLastLogIs:[%d]\n%s\nLogs: %v\n", rf.me, lastIndex, args.String(), rf.logs)
 	if args.PrevLogIndex > lastIndex {
-		rf.logger.Printf("[%d] receive beyond conflict logs", rf.me)
+		if debug {
+			rf.logger.Printf("[%d] receive beyond conflict logs\nlogs[%v]", rf.me, rf.logs)
+		}
 		reply.Conflict = true
 		reply.XTerm = -1
 		reply.XIndex = rf.getLastLogIndex()
@@ -809,7 +842,7 @@ func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply)
 			break
 		}
 	}
-	if args.Entries != nil && len(args.Entries) != 0 {
+	if args.Entries != nil && len(args.Entries) != 0 && debug {
 		rf.logger.Printf("[%d] append [%d] logs\nrf's logs: [%v]\nnew logs: [%v]", rf.me, len(args.Entries), rf.logs, args.Entries)
 	}
 	rf.persist()
