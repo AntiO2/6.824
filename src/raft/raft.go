@@ -73,6 +73,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -253,6 +254,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		CommandValid:  false,
 		Command:       nil,
 		CommandIndex:  -1,
+		CommandTerm:   -1,
 		SnapshotValid: true,
 		Snapshot:      args.Data,
 		SnapshotTerm:  int(args.LastIncludedTerm),
@@ -870,6 +872,7 @@ func (rf *Raft) doApply() {
 				CommandValid:  true,
 				Command:       rf.getIthIndex(rf.applyIndex).Command,
 				CommandIndex:  int(rf.applyIndex),
+				CommandTerm:   int(rf.getIthIndex(rf.applyIndex).Term),
 				SnapshotValid: false,
 				Snapshot:      nil,
 				SnapshotTerm:  0,
