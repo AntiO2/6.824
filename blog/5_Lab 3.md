@@ -346,4 +346,3 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 ```
 
 其中，kvdb就是用map操作实现的kv内存数据库。
-

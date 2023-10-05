@@ -57,6 +57,7 @@ func (ck *Clerk) Get(key string) string {
 	serverNum := len(ck.servers)
 	for ; ; serverId = (serverId + 1) % serverNum {
 		var reply GetReply
+		DPrintf("Client Send [%v] Get Op:[%v]", serverId, args)
 		ok := ck.servers[serverId].Call("KVServer.Get", &args, &reply) // 调用Server的Get Handler
 		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
 			continue
@@ -94,6 +95,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	serverNum := len(ck.servers)
 	for ; ; serverId = (serverId + 1) % serverNum {
 		var reply PutAppendReply
+		DPrintf("Client Send [%v] PutAppend Op:[%v]", serverId, args)
 		ok := ck.servers[serverId].Call("KVServer.PutAppend", &args, &reply)
 		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
 			continue

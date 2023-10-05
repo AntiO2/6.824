@@ -39,7 +39,8 @@ type indexT int
 type statusT int
 
 const (
-	debug bool = false
+	debug   bool = false
+	verbose bool = false
 )
 const (
 	follower statusT = iota
@@ -460,7 +461,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	// rf.logger.Printf("Leader [%d] \nLog [%v]\n", rf.me, rf.logs)
 	rf.logLatch.Unlock()
-	// rf.appendEntries(false)
+	go rf.appendEntries(false)
 	return int(index), term, isLeader
 }
 
@@ -635,7 +636,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 			if rf.nextIndex[i] > lastIndex {
 				rf.nextIndex[i] = lastIndex + 1
 			}
-			if debug {
+			if debug && verbose {
 				rf.logger.Printf("Leader[%d]\t handling[%d]\tLastIncludeIndex:%d\n ApplyIndex:[%d]\tCommitIndex:[%d]\nLog:[%v]\n NextIndex:[%d]\n", rf.me, i, rf.getLastIncludeIndex(), rf.applyIndex, rf.commitIndex, rf.logs, rf.nextIndex[i])
 			}
 			if rf.nextIndex[i] <= rf.getLastIncludeIndex() {
@@ -701,7 +702,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 				if debug {
 					if len(args.Entries) > 0 {
 						rf.logger.Printf("[%d] Send AppendRPC To [%d]\n[%s]\nLogs: [%v]", rf.me, peerId, args.String(), args.Entries)
-					} else {
+					} else if verbose {
 						rf.logger.Printf("[%d] Send Heartbeat To [%d]\n[%s]\npTerm: %d\tpIndex: %d\n", rf.me, peerId, args.String(), args.PrevLogTerm, args.PrevLogIndex)
 					}
 				}
@@ -723,8 +724,8 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 					}
 					return
 				}
-				if debug {
-					rf.logger.Printf("Leader[%d] receive from [%d]reply : success:[%v] conflict[%v] hearBeat[%v]\n XTerm: %d\tXIndex: %d\n", rf.me, peerId, reply.Success, reply.Conflict,
+				if debug && (len(args.Entries) > 0 || verbose) {
+					rf.logger.Printf("Leader[%d] receive from [%d]reply : success:[%v] conflict[%v] hearBeat[%v]\t XTerm: %d\tXIndex: %d\n", rf.me, peerId, reply.Success, reply.Conflict,
 						heartBeat, reply.XTerm, reply.XIndex)
 				}
 				rf.logLatch.RLock()
@@ -827,7 +828,7 @@ func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply)
 	//  if args.Entries != nil && len(args.Entries) != 0 {
 	//		rf.logger.Printf("[%d] append [%d] logs\nprev rf's logs: [%v]\nnew logs: [%v]", rf.me, len(args.Entries), rf.logs, args.Entries)
 	// 	s}
-	if debug {
+	if debug && verbose {
 		rf.logger.Printf("[%d] receive no conflict logs\nApplyIndex is [%d]\tcommitIndex is [%d]\tleaderCommit [%d]\n", rf.me, rf.applyIndex, rf.commitIndex, args.LeaderCommit)
 	}
 

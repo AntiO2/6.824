@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -70,6 +70,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			return
 		}
 	}
+	kv.mu.Unlock()
 	op := Op{
 		OpType:    GetOperation,
 		Key:       args.Key,
@@ -84,7 +85,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	replyCh := make(chan ApplyResult)
+	DPrintf("Leader[%d] Receive Op\t:%v\tIndex[%d]", kv.me, op, index)
+	replyCh := make(chan ApplyResult, 1)
 	kv.mu.Lock()
 	kv.replyChMap[index] = replyCh
 	kv.mu.Unlock()
@@ -112,15 +114,18 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	if clientReply, ok := kv.clientReply[args.ClientId]; ok {
 		if args.CommandId == clientReply.CommandId {
+			DPrintf("Client[%d] Receive Same Command [%d]", kv.me, args.CommandId)
 			reply.Err = clientReply.Reply.ErrMsg
 			kv.mu.Unlock()
 			return
 		} else if args.CommandId < clientReply.CommandId {
+			DPrintf("Client[%d] Receive OutDate Command [%d]", kv.me, args.CommandId)
 			reply.Err = ErrOutDate // 已经没有了之前执行的记录。
 			kv.mu.Unlock()
 			return
 		}
 	}
+	kv.mu.Unlock()
 	op := Op{
 		OpType:    args.Op,
 		Key:       args.Key,
@@ -130,12 +135,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	index, term, isLeader := kv.rf.Start(op)
-
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		DPrintf("Client[%d] Isn't Leader", kv.me)
 		return
 	}
-	replyCh := make(chan ApplyResult)
+	DPrintf("Leader[%d] Receive Op\n:%v\nIndex[%d]", kv.me, op, index)
+	replyCh := make(chan ApplyResult, 1)
 	kv.mu.Lock()
 	kv.replyChMap[index] = replyCh
 	kv.mu.Unlock()
@@ -202,9 +208,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.replyChMap = make(map[int]chan ApplyResult)
+	kv.clientReply = make(map[int64]CommandContext)
 	// You may need initialization code here.
 	kv.lastApplied = 0
+	kv.kvdb.Init()
+
 	go kv.handleApplyMsg()
 	return kv
 }
@@ -225,9 +234,11 @@ func (kv *KVServer) handleApplyMsg() {
 		applyMsg := <-kv.applyCh
 		if applyMsg.CommandValid {
 			go kv.applyCommand(applyMsg)
+			continue
 		}
 		if applyMsg.SnapshotValid {
 			go kv.applySnapshot(applyMsg)
+			continue
 		}
 		_, err := DPrintf("Error Apply Msg: [%v]", applyMsg)
 		if err != nil {
@@ -239,10 +250,13 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 	var applyResult ApplyResult
 	op := msg.Command.(Op)
 	applyResult.Term = msg.CommandTerm
+	kv.mu.Lock()
 	commandContext, ok := kv.clientReply[op.ClientId]
+	kv.mu.Unlock()
 	if ok && commandContext.CommandId >= op.CommandId {
 		// 该指令已经被应用过。
 		// applyResult = commandContext.Reply
+
 		return
 	}
 	switch op.OpType {
@@ -269,14 +283,18 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 	default:
 		DPrintf("Error Op Type %s", op.OpType)
 	}
+	kv.mu.Lock()
 	ch, ok := kv.replyChMap[msg.CommandIndex]
+	kv.mu.Unlock()
 	if ok {
 		ch <- applyResult
 	}
+	kv.mu.Lock()
 	kv.clientReply[op.ClientId] = CommandContext{
 		CommandId: op.CommandId,
 		Reply:     applyResult,
 	}
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {

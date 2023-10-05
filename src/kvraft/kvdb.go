@@ -4,6 +4,9 @@ type KvDataBase struct {
 	KvData map[string]string
 }
 
+func (kv *KvDataBase) Init() {
+	kv.KvData = make(map[string]string)
+}
 func (kv *KvDataBase) Get(key string) (value string, ok bool) {
 	if value, ok := kv.KvData[key]; ok {
 		return value, ok
