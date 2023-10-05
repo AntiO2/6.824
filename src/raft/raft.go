@@ -461,7 +461,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	// rf.logger.Printf("Leader [%d] \nLog [%v]\n", rf.me, rf.logs)
 	rf.logLatch.Unlock()
-	go rf.appendEntries(false)
+	// go rf.appendEntries(false)
 	return int(index), term, isLeader
 }
 
@@ -494,6 +494,21 @@ func (rf *Raft) ticker() {
 	rf.mu.Lock()
 	rf.setElectionTime()
 	rf.mu.Unlock()
+	// for append new log
+	go func() {
+		for rf.killed() == false {
+			time.Sleep(rf.heartBeat / 5)
+			rf.mu.Lock()
+			if rf.status == leader {
+				// 如果是leader状态,发送空包
+				rf.setElectionTime()
+				rf.mu.Unlock()
+				rf.appendEntries(false)
+				continue
+			}
+			rf.mu.Unlock()
+		}
+	}()
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should

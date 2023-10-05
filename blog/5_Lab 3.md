@@ -346,3 +346,83 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 ```
 
 其中，kvdb就是用map操作实现的kv内存数据库。
+
+### 调试
+
+**关于心跳选择**
+
+在[[MIT6.824\] Spring2021 Lab 2: Raft - AntiO2's Blog](https://blog.antio2.cn/index.php/archives/178/)中，我的RAFT写法是当收到log时不触发心跳，而是在等待固定间隔时发送心跳。这样就会导致`TestSpeed3A`中的操作过慢，因为客户端在上一条操作成功后才会进行下一条，导致但客户端时一条操作的时间必然大于心跳间隔，但是测试中要求一个心跳间隔至少进行3次操作。
+
+所以还是需要在收到log时发送一条信息,但是这样又会导致多个client同时append log时，发送的RPC过多。
+
+
+
+于是我想了如下优化：
+
+首先是在TestPersistConcurrent3A测试中，采用每次接收新log都要发送一轮新消息的形式，共发送32104条log
+
+> ... Passed --  21.7  5 32104 1379
+
+在raft的ticker中修改
+
+```go
+func (rf *Raft) ticker() {
+	rf.mu.Lock()
+	rf.setElectionTime()
+	rf.mu.Unlock()
+	// for append new log
+	go func() {
+		for rf.killed() == false {
+			time.Sleep(rf.heartBeat / 30)
+			rf.mu.Lock()
+			if rf.status == leader {
+				// 如果是leader状态,发送空包
+				rf.setElectionTime()
+				rf.mu.Unlock()
+				rf.appendEntries(false)
+				continue
+			}
+			rf.mu.Unlock()
+		}
+	}()
+	for rf.killed() == false {
+
+		// Your code here to check if a leader election should
+		// be started and to randomize sleeping time using
+		// time.Sleep().
+		time.Sleep(rf.heartBeat)
+		rf.mu.Lock()
+		if rf.status == leader {
+			// 如果是leader状态,发送空包
+			rf.setElectionTime()
+			rf.mu.Unlock()
+			rf.appendEntries(true)
+			continue
+		}
+		if time.Now().After(rf.electionTime) {
+			// 如果已经超时， 开始选举
+			go rf.startElection()
+		}
+		rf.mu.Unlock()
+	}
+}
+```
+
+相当于新增加了一个间隔为heartbeat/5的检测，如果有新的log就发送RPC请求，没有就不发送RPC（正常的heartbeat是无论有无新log都要发送）。
+
+再次进行测试，
+
+> ​    ... Passed --  21.5  5 25873 1623
+
+发送的RPC减少了，而且进行的操作数量也有所提升。（相当于进行了更高频的心跳，但是只有在有新log未同步时，才会触发这种高频心跳）
+
+
+
+**关于Data Race**
+
+在多客户端时,因为收到apply msg时,会启动一个apply command的go程,如果多个客户端同时get或put一个key,会导致data race.
+
+解决方法：因为要严格按照log顺序apply，所以应当是直接调用apply command函数，而不是启动go程。
+
+## Part B: Key/value service with snapshots
+

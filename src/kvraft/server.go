@@ -233,11 +233,11 @@ func (kv *KVServer) handleApplyMsg() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
 		if applyMsg.CommandValid {
-			go kv.applyCommand(applyMsg)
+			kv.applyCommand(applyMsg)
 			continue
 		}
 		if applyMsg.SnapshotValid {
-			go kv.applySnapshot(applyMsg)
+			kv.applySnapshot(applyMsg)
 			continue
 		}
 		_, err := DPrintf("Error Apply Msg: [%v]", applyMsg)
