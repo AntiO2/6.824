@@ -50,10 +50,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	clientReply map[int64]CommandContext
-	replyChMap  map[int]chan ApplyResult // log的index对应的返回信息。
-	lastApplied int
-	kvdb        KvDataBase
+	clientReply      map[int64]CommandContext
+	replyChMap       map[int]chan ApplyResult // log的index对应的返回信息。
+	lastAppliedIndex int                      // kv数据库中最后应用的index.
+	kvdb             KvDataBase
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -140,7 +140,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		DPrintf("Client[%d] Isn't Leader", kv.me)
 		return
 	}
-	DPrintf("Leader[%d] Receive Op\n:%v\nIndex[%d]", kv.me, op, index)
+	DPrintf("Leader[%d] Receive Op\t:%v\tIndex[%d]", kv.me, op, index)
 	replyCh := make(chan ApplyResult, 1)
 	kv.mu.Lock()
 	kv.replyChMap[index] = replyCh
@@ -211,10 +211,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.replyChMap = make(map[int]chan ApplyResult)
 	kv.clientReply = make(map[int64]CommandContext)
 	// You may need initialization code here.
-	kv.lastApplied = 0
-	kv.kvdb.Init()
 
+	kv.kvdb.Init(persister.ReadSnapshot())
+	kv.lastAppliedIndex = int(kv.rf.GetLastIncludeIndex())
 	go kv.handleApplyMsg()
+	go kv.makeSnapshot()
 	return kv
 }
 func (kv *KVServer) CloseIndexCh(index int) {
@@ -256,9 +257,9 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 	if ok && commandContext.CommandId >= op.CommandId {
 		// 该指令已经被应用过。
 		// applyResult = commandContext.Reply
-
 		return
 	}
+	kv.mu.Lock()
 	switch op.OpType {
 	case GetOperation:
 		{
@@ -283,7 +284,6 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 	default:
 		DPrintf("Error Op Type %s", op.OpType)
 	}
-	kv.mu.Lock()
 	ch, ok := kv.replyChMap[msg.CommandIndex]
 	kv.mu.Unlock()
 	if ok {
@@ -294,8 +294,28 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 		CommandId: op.CommandId,
 		Reply:     applyResult,
 	}
+	kv.lastAppliedIndex = max(kv.lastAppliedIndex, msg.CommandIndex)
 	kv.mu.Unlock()
 }
 
 func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
+	if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+		kv.lastAppliedIndex = msg.SnapshotIndex
+		kv.kvdb.InstallSnapshot(msg.Snapshot)
+	}
+}
+
+func (kv *KVServer) makeSnapshot() {
+	for !kv.killed() {
+		time.Sleep(time.Millisecond * 100)
+		kv.mu.Lock()
+		sizeNow := kv.rf.GetRaftStateSize()
+		DPrintf("Server[%d] Raft Size Is [%d] LastIncludeIndex [%d]", kv.me, sizeNow, kv.rf.GetLastIncludeIndex())
+		if sizeNow > kv.maxraftstate/2 {
+			DPrintf("Server[%d] Start to Make Snapshot", kv.me)
+			kv.rf.Snapshot(kv.lastAppliedIndex, kv.kvdb.GenSnapshot())
+			DPrintf("Server[%d] Raft Size Is [%d] After Snapshot", kv.me, kv.rf.GetRaftStateSize())
+		}
+		kv.mu.Unlock()
+	}
 }

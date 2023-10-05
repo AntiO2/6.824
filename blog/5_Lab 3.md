@@ -426,3 +426,117 @@ func (rf *Raft) ticker() {
 
 ## Part B: Key/value service with snapshots
 
+> The tester passes `maxraftstate` to your `StartKVServer()`. `maxraftstate` indicates the maximum allowed size of your persistent Raft state in bytes (including the log, but not including snapshots). 
+
+maxraftstate指示了Raft最大的logs大小。
+
+> You should compare `maxraftstate` to `persister.RaftStateSize()`. Whenever your key/value server detects that the Raft state size is approaching this threshold, it should save a snapshot using `Snapshot`, which in turn uses `persister.SaveRaftState()`. If `maxraftstate` is -1, you do not have to snapshot. `maxraftstate` applies to the GOB-encoded bytes your Raft passes to `persister.SaveRaftState()`.
+
+当raft的statesize**快要接近**maxraftstate时，使用snapshot制作快照。
+
+
+
+首先实现状态机（KV数据库）生成和安装快照
+
+```go
+func (kv *KvDataBase) GenSnapshot() []byte {
+    w := new(bytes.Buffer)
+    encode := gob.NewEncoder(w)
+    err := encode.Encode(kv.KvData)
+    if err != nil {
+       return nil
+    }
+    return w.Bytes()
+}
+func (kv *KvDataBase) InstallSnapshot(data []byte) {
+    if data == nil || len(data) < 1 { // bootstrap without any state?
+       return
+    }
+    r := bytes.NewBuffer(data)
+    encode := gob.NewDecoder(r)
+    err := encode.Decode(&kv.KvData)
+    if err != nil {
+       panic(err.Error())
+    }
+}
+```
+
+在kvserver收到raft层的快照消息后，尝试将快照状态传递给raft,告诉它：我准备应用了。（如果是过期快照就不会应用），然后如果raft应用该快照，就安装。
+
+```go
+func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
+	if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+		kv.lastAppliedIndex = msg.SnapshotIndex
+		kv.kvdb.InstallSnapshot(msg.Snapshot)
+	}
+}
+```
+
+首先在内存的KV数据库中应用快照，然后告诉raft已经应用了快照。
+
+接下来就要考虑生成快照的时机了。因为append log是并发的，在Start Op时判断是否生成快照感觉不太好，因为此时新的操作还没有被应用到数据库里面。
+
+如果在apply里面生成快照，还能起到阻塞新的操作的作用。感觉是个挺好的选择。
+
+我们还需要维护一个新的`lastApplied int`， 表示制作快照时已经应用的**raft索引**。kvserver在初始化时，应当将lastApplied初始化为snapshot所包含的最后一条索引。
+
+```go
+kv.kvdb.Init(persister.ReadSnapshot())
+kv.lastAppliedIndex = int(kv.rf.GetLastIncludeIndex())
+```
+
+然后在ApplyCommand中，增加制作快照。
+
+```go
+kv.lastAppliedIndex = max(kv.lastAppliedIndex, msg.CommandIndex)
+if kv.rf.GetRaftStateSize() > kv.maxraftstate {
+    kv.rf.Snapshot(msg.CommandIndex, kv.kvdb.GenSnapshot())
+}
+```
+
+### 调试
+
+**关于生成snapshot的时机**
+
+上面的几行代码已经足够通过3B的前几个测试，但是在TestSnapshotRecoverManyClients3B中出现了问题。
+
+报错`test_test.go:362: logs were not trimmed (56767 > 8*1000)`
+
+在多个客户端时，虽然成功生成了快照，但是出现了这么一种情况：
+
+在apply一个新的操作后，发现raft的size过大，比如是10000，这个时候生成快照，但是新apply的index可能只往前推了几条，比如旧log有167条，其中只有5条被确认apply了，生成快照后还有162条在raft state中。
+
+出现这种情况，可能是apply过慢, 因为snapshot本身要对数据库编码存储，需要耗费比较长的时间，所以不能每次apply都进行一次snapshot操作。
+
+所以应当每隔一段时间进行snapshot操作，而不是每次applycommand都进行。比如目前commit index是100（假设超过了设定的max state），apply index 是0，使用定时器，就可以让kvserver快速apply command。而不是在每次apply之后进行snapshot操作。
+
+
+
+**需要修改raft代码**
+
+因为所有的kvserver都能独立生成snapshot,所以可能出现leader尝试发送的log已经不存在于follower的log中的情况，这种时候就需要判断哪些logs是有用的。
+
+```go
+if args.PrevLogIndex < lastIncludeIndex {
+    // 这里可能出现args.PrevLogIndex < lastIncludeIndex的情况
+    // 如果所有的logs都很过时（已经包含在当前快照里面），就都不需要，否则保留新的。
+
+    entryLen := len(args.Entries)
+
+    if args.PrevLogIndex+IndexT(entryLen) <= lastIncludeIndex {
+       rf.logger.Printf("[%d] receive outdated logs before snapshot", rf.me)
+       reply.Success = true
+       reply.Conflict = false
+       rf.logLatch.RUnlock()
+       return
+    }
+    trim := lastIncludeIndex - args.PrevLogIndex // 多余的部分
+    // args.PrevLogIndex+IndexT(entryLen) > lastIncludeIndex
+    //     IndexT(entryLen) > trim
+    args.PrevLogIndex = args.Entries[trim-1].Index
+    args.PrevLogTerm = args.Entries[trim-1].Term
+    args.Entries = args.Entries[trim:]
+}
+```
+
+因为这个问题在Lab2D中没有出现，所以当时没有发现这个bug

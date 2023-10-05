@@ -35,12 +35,12 @@ import (
 )
 
 type termT int
-type indexT int
+type IndexT int
 type statusT int
 
 const (
-	debug   bool = false
-	verbose bool = false
+	debug   bool = true
+	verbose bool = true
 )
 const (
 	follower statusT = iota
@@ -57,7 +57,7 @@ const (
 
 type Log struct {
 	Term    termT
-	Index   indexT
+	Index   IndexT
 	Command interface{}
 }
 
@@ -102,11 +102,11 @@ type Raft struct {
 	logs         []Log
 	votedFor     int
 
-	commitIndex indexT
-	applyIndex  indexT
+	commitIndex IndexT
+	applyIndex  IndexT
 
-	nextIndex  []indexT
-	matchIndex []indexT
+	nextIndex  []IndexT
+	matchIndex []IndexT
 
 	logger    *log.Logger
 	applySign chan bool
@@ -186,8 +186,8 @@ func (rf *Raft) readSnapshot(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-	rf.logger.Printf("[%d]  CondInstallSnapshot LastInclude Index[%d]\n", rf.me, lastIncludedIndex)
-	lastIncludedIndex2 := indexT(lastIncludedIndex)
+	rf.logger.Printf("[%d]Start CondInstallSnapshot LastInclude Index[%d]\n", rf.me, lastIncludedIndex)
+	lastIncludedIndex2 := IndexT(lastIncludedIndex)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	//if lastIncludedIndex2 <= rf.commitIndex {
@@ -196,14 +196,14 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	//}
 	rf.logLatch.Lock()
 	defer rf.logLatch.Unlock()
-	if lastIncludedTerm == int(rf.getLastIncludeTerm()) && lastIncludedIndex == int(rf.getLastIncludeIndex()) {
+	if lastIncludedTerm == int(rf.getLastIncludeTerm()) && lastIncludedIndex == int(rf.GetLastIncludeIndex()) {
 		rf.logger.Printf("replicate snapshot") // 重复安装的快照
 		return false
 	}
 	if lastIncludedIndex2 < rf.getLastLogIndex() && rf.getLastLogTerm() == termT(lastIncludedTerm) {
 		// 	If existing log entry has same index and Term as snapshot’s
 		//	last included entry, retain log entries following it and reply
-		rf.logs = append([]Log(nil), rf.logs[rf.getLogOffset()+lastIncludedTerm:]...)
+		rf.logs = append([]Log(nil), rf.logs[rf.getLogOffset()+lastIncludedIndex:]...)
 	} else {
 		// Discard the entire log
 		rf.logs = append([]Log(nil), Log{
@@ -217,7 +217,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.applyIndex = lastIncludedIndex2
 	rf.saveRaftStateAndSnapshot()
 	if debug {
-		rf.logger.Printf("[%d]Install Snapshot\nCommitIndex[%d]", rf.me, rf.commitIndex)
+		rf.logger.Printf("[%d]Install Snapshot\tCommitIndex[%d]", rf.me, rf.commitIndex)
 	}
 	return true
 }
@@ -225,7 +225,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 type InstallSnapshotArgs struct {
 	Term              termT
 	LeaderId          int
-	LastIncludedIndex indexT
+	LastIncludedIndex IndexT
 	LastIncludedTerm  termT
 	// offset int
 	Data []byte
@@ -246,7 +246,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	reply.Term = rf.currentTerm
 	rf.logLatch.RLock()
-	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.getLastIncludeIndex() {
+	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.GetLastIncludeIndex() {
 		rf.logLatch.RUnlock()
 		return
 	}
@@ -275,12 +275,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if debug {
 		rf.logger.Printf("[%d] Snapshot to index [%d]\n", rf.me, index)
 	}
-	idx := indexT(index)
+	idx := IndexT(index)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.logLatch.Lock()
 	defer rf.logLatch.Unlock()
-	if idx <= rf.getLastIncludeIndex() {
+	if idx <= rf.GetLastIncludeIndex() {
 		rf.logger.Println("Outdated Snapshot")
 		return
 	}
@@ -296,8 +296,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		}
 	}
 	rf.snapshot = snapshot
-	rf.commitIndex = indexT(index)
-	rf.applyIndex = indexT(index)
+	rf.commitIndex = IndexT(index)
+	rf.applyIndex = IndexT(index)
 	rf.saveRaftStateAndSnapshot()
 }
 
@@ -307,7 +307,7 @@ type RequestVoteArgs struct {
 	// Your Data here (2A, 2B).
 	CandidateTerm termT
 	CandidateId   int
-	LastLogEntry  indexT
+	LastLogEntry  IndexT
 	LastLogTerm   termT
 }
 
@@ -440,7 +440,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
-	var index indexT = -1
+	var index IndexT = -1
 	// Your code here (2B).
 	term, isLeader := rf.GetState()
 	if !isLeader {
@@ -572,13 +572,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peerNum = len(peers)
 	rf.status = follower
 
-	rf.nextIndex = make([]indexT, rf.peerNum)
-	rf.matchIndex = make([]indexT, rf.peerNum)
+	rf.nextIndex = make([]IndexT, rf.peerNum)
+	rf.matchIndex = make([]IndexT, rf.peerNum)
 	rf.applyCh = applyCh
 	rf.applySign = make(chan bool)
 
-	rf.commitIndex = rf.getLastIncludeIndex()
-	rf.applyIndex = rf.getLastIncludeIndex()
+	rf.commitIndex = rf.GetLastIncludeIndex()
+	rf.applyIndex = rf.GetLastIncludeIndex()
 	lastLogIndex := rf.getLastLogIndex()
 
 	for i := range rf.nextIndex {
@@ -623,7 +623,7 @@ func (rf *Raft) startElection() {
 }
 
 // getLastLogIndex returns the last Index of logs
-func (rf *Raft) getLastLogIndex() indexT {
+func (rf *Raft) getLastLogIndex() IndexT {
 	if len(rf.logs) == 0 {
 		log.Fatalln("Log Len is Zero")
 	}
@@ -652,9 +652,9 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 				rf.nextIndex[i] = lastIndex + 1
 			}
 			if debug && verbose {
-				rf.logger.Printf("Leader[%d]\t handling[%d]\tLastIncludeIndex:%d\n ApplyIndex:[%d]\tCommitIndex:[%d]\nLog:[%v]\n NextIndex:[%d]\n", rf.me, i, rf.getLastIncludeIndex(), rf.applyIndex, rf.commitIndex, rf.logs, rf.nextIndex[i])
+				rf.logger.Printf("Leader[%d]\t handling[%d]\tLastIncludeIndex:%d\n ApplyIndex:[%d]\tCommitIndex:[%d]\nLog:[%v]\n NextIndex:[%d]\n", rf.me, i, rf.GetLastIncludeIndex(), rf.applyIndex, rf.commitIndex, rf.logs, rf.nextIndex[i])
 			}
-			if rf.nextIndex[i] <= rf.getLastIncludeIndex() {
+			if rf.nextIndex[i] <= rf.GetLastIncludeIndex() {
 				rf.logLatch.RUnlock()
 				// 已经不包含需要的Log了
 				go func(rf *Raft, peerId int) {
@@ -665,7 +665,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 					args := InstallSnapshotArgs{
 						Term:              rf.currentTerm,
 						LeaderId:          rf.me,
-						LastIncludedIndex: rf.getLastIncludeIndex(),
+						LastIncludedIndex: rf.GetLastIncludeIndex(),
 						LastIncludedTerm:  rf.getLastIncludeTerm(),
 						Data:              rf.snapshot,
 					}
@@ -755,7 +755,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 						if lastIndexInXTerm == -1 {
 							rf.nextIndex[peerId] = reply.XIndex
 						} else {
-							rf.nextIndex[peerId] = indexT(lastIndexInXTerm + 1)
+							rf.nextIndex[peerId] = IndexT(lastIndexInXTerm + 1)
 						}
 					} else {
 						rf.logger.Println("Follower Too Short")
@@ -765,7 +765,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 					rf.logger.Printf("Leader[%d] NextIndex Of [%d] Update To [%d]\n", rf.me, peerId, rf.nextIndex[peerId])
 				} else if reply.Success && len(args.Entries) > 0 {
 					rf.logger.Println("Success Update")
-					rf.matchIndex[peerId] = max(args.PrevLogIndex+indexT(len(args.Entries)), rf.matchIndex[peerId])
+					rf.matchIndex[peerId] = max(args.PrevLogIndex+IndexT(len(args.Entries)), rf.matchIndex[peerId])
 					rf.nextIndex[peerId] = max(rf.nextIndex[peerId], rf.matchIndex[peerId]+1)
 					rf.logger.Printf("Leader[%d] NextIndex Of [%d] Update To [%d]\n", rf.me, peerId, rf.nextIndex[peerId])
 				}
@@ -779,10 +779,10 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 type appendEntryArgs struct {
 	Term         termT  //leader’s Term
 	LeaderId     int    // so follower can redirect clients
-	PrevLogIndex indexT //Index of log entry immediately preceding new ones
+	PrevLogIndex IndexT //Index of log entry immediately preceding new ones
 	PrevLogTerm  termT  // Term of PrevLogIndex entry
 	Entries      []Log  // log Entries to store (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommit indexT // leader’s commitIndex
+	LeaderCommit IndexT // leader’s commitIndex
 }
 
 type appendEntryReply struct {
@@ -790,7 +790,7 @@ type appendEntryReply struct {
 	Success  bool  // true if follower contained entry matching PrevLogIndex and PrevLogTerm
 	Conflict bool
 	XTerm    termT
-	XIndex   indexT
+	XIndex   IndexT
 }
 
 func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply) {
@@ -805,7 +805,7 @@ func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply)
 		rf.setElectionTime() // check(AntiO2)
 		rf.setTerm(args.Term)
 		rf.logger.Printf("[%d] become a follower\n", rf.me)
-		return
+		// return
 	}
 	if args.Term < rf.currentTerm {
 		rf.logger.Printf("[%d] Receive Outdated RPC\n", rf.me)
@@ -818,7 +818,9 @@ func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply)
 	reply.Success = false
 	rf.logLatch.RLock()
 	lastIndex := rf.getLastLogIndex()
-	// rf.logger.Printf("[%d] Receive Append Entry \nLastLogIs:[%d]\n%s\nLogs: %v\n", rf.me, lastIndex, args.String(), rf.logs)
+	if debug {
+		rf.logger.Printf("[%d] Receive Append Entry \tLastLogIs:[%d]\t%s\tLogs: %v\t", rf.me, lastIndex, args.String(), rf.logs)
+	}
 	if args.PrevLogIndex > lastIndex {
 		if debug {
 			rf.logger.Printf("[%d] receive beyond conflict logs\nlogs[%v]", rf.me, rf.logs)
@@ -828,6 +830,27 @@ func (rf *Raft) AppendEntriesRPC(args *appendEntryArgs, reply *appendEntryReply)
 		reply.XIndex = rf.getLastLogIndex()
 		rf.logLatch.RUnlock()
 		return
+	}
+	lastIncludeIndex := rf.GetLastIncludeIndex()
+	if args.PrevLogIndex < lastIncludeIndex {
+		// 这里可能出现args.PrevLogIndex < lastIncludeIndex的情况
+		// 如果所有的logs都很过时（已经包含在当前快照里面），就都不需要，否则保留新的。
+
+		entryLen := len(args.Entries)
+
+		if args.PrevLogIndex+IndexT(entryLen) <= lastIncludeIndex {
+			rf.logger.Printf("[%d] receive outdated logs before snapshot", rf.me)
+			reply.Success = true
+			reply.Conflict = false
+			rf.logLatch.RUnlock()
+			return
+		}
+		trim := lastIncludeIndex - args.PrevLogIndex // 多余的部分 2 3 4 5 6 last:3 prev:1 trim = 2
+		// args.PrevLogIndex+IndexT(entryLen) > lastIncludeIndex
+		// 	IndexT(entryLen) > trim
+		args.PrevLogIndex = args.Entries[trim-1].Index
+		args.PrevLogTerm = args.Entries[trim-1].Term
+		args.Entries = args.Entries[trim:]
 	}
 	if rf.getIthIndex(args.PrevLogIndex).Term != args.PrevLogTerm {
 		rf.logger.Printf("[%d] receive prev Term conflict logs", rf.me)
@@ -944,7 +967,7 @@ func (a appendEntryArgs) String() string {
 		"PrevLogIndex" + strconv.Itoa(int(a.PrevLogIndex)) + "\n"
 	return args
 }
-func (rf *Raft) getIthIndex(t indexT) *Log {
+func (rf *Raft) getIthIndex(t IndexT) *Log {
 	idx := int(t) + rf.getLogOffset()
 	if idx >= len(rf.logs) {
 		rf.logger.Fatalf("Try get index [%d] Out of range\n", t)
@@ -965,10 +988,10 @@ func (rf *Raft) getLastLogIndexInXTerm(xTerm termT, xIndex int) int {
 		}
 		idx++
 	}
-	return idx + int(rf.getLastIncludeIndex())
+	return idx + int(rf.GetLastIncludeIndex())
 }
 
-func (rf *Raft) getFirstLogIndexInXTerm(xTerm termT, prevIndex indexT) indexT {
+func (rf *Raft) getFirstLogIndexInXTerm(xTerm termT, prevIndex IndexT) IndexT {
 	// rf.logger.Printf("In Get FirstLogIndexInXTerm\nS[%d]\nlogs: %v", rf.me, rf.logs)
 	idx := min(prevIndex, rf.getLastLogIndex())
 	if rf.getIthIndex(idx).Term != xTerm {
@@ -983,13 +1006,15 @@ func (rf *Raft) getFirstLogIndexInXTerm(xTerm termT, prevIndex indexT) indexT {
 	return idx
 }
 
-func (rf *Raft) getLastIncludeIndex() indexT {
+func (rf *Raft) GetLastIncludeIndex() IndexT {
 	return rf.logs[0].Index
 }
 func (rf *Raft) getLastIncludeTerm() termT {
 	return rf.logs[0].Term
 }
-
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
 func (rf *Raft) getLogOffset() int {
 	return int(-rf.logs[0].Index)
 }
