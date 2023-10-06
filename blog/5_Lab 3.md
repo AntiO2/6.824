@@ -539,4 +539,18 @@ if args.PrevLogIndex < lastIncludeIndex {
 }
 ```
 
-因为这个问题在Lab2D中没有出现，所以当时没有发现这个bug
+因为这个问题在Lab2D中没有出现，所以当时没有发现这个bug。
+
+
+
+**snapshot的内容：**
+
+保存对client的历史回复也应当被保存在snapshot的快照中。
+
+
+
+**关于重复的Put/Append**
+
+当putappend重复时，也应当返回。这样client才能更新commandid
+
+因为在不可靠网络环境下，可能已经进行了更新操作，但是没有及时返回，clerk再次尝试请求，此时结果已经存放好了。

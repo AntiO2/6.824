@@ -4,13 +4,15 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
+	"encoding/gob"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -111,15 +113,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	DPrintf("Server [%d] Receive Request\t:%v", kv.me, args)
 	kv.mu.Lock()
 	if clientReply, ok := kv.clientReply[args.ClientId]; ok {
 		if args.CommandId == clientReply.CommandId {
-			DPrintf("Client[%d] Receive Same Command [%d]", kv.me, args.CommandId)
-			reply.Err = clientReply.Reply.ErrMsg
+			DPrintf("Server [%d] Receive Same Command [%d]", kv.me, args.CommandId)
 			kv.mu.Unlock()
 			return
 		} else if args.CommandId < clientReply.CommandId {
-			DPrintf("Client[%d] Receive OutDate Command [%d]", kv.me, args.CommandId)
+			DPrintf("Server  [%d] Receive OutDate Command [%d]", kv.me, args.CommandId)
 			reply.Err = ErrOutDate // 已经没有了之前执行的记录。
 			kv.mu.Unlock()
 			return
@@ -212,7 +214,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.clientReply = make(map[int64]CommandContext)
 	// You may need initialization code here.
 
-	kv.kvdb.Init(persister.ReadSnapshot())
+	kv.kvdb.Init()
+	kv.ReadSnapshot(persister.ReadSnapshot())
 	kv.lastAppliedIndex = int(kv.rf.GetLastIncludeIndex())
 	go kv.handleApplyMsg()
 	go kv.makeSnapshot()
@@ -233,6 +236,7 @@ func (kv *KVServer) CloseIndexCh(index int) {
 func (kv *KVServer) handleApplyMsg() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
+
 		if applyMsg.CommandValid {
 			kv.applyCommand(applyMsg)
 			continue
@@ -252,14 +256,13 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 	op := msg.Command.(Op)
 	applyResult.Term = msg.CommandTerm
 	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	commandContext, ok := kv.clientReply[op.ClientId]
-	kv.mu.Unlock()
 	if ok && commandContext.CommandId >= op.CommandId {
 		// 该指令已经被应用过。
 		// applyResult = commandContext.Reply
 		return
 	}
-	kv.mu.Lock()
 	switch op.OpType {
 	case GetOperation:
 		{
@@ -284,24 +287,23 @@ func (kv *KVServer) applyCommand(msg raft.ApplyMsg) {
 	default:
 		DPrintf("Error Op Type %s", op.OpType)
 	}
+	kv.lastAppliedIndex = msg.CommandIndex
 	ch, ok := kv.replyChMap[msg.CommandIndex]
-	kv.mu.Unlock()
 	if ok {
 		ch <- applyResult
 	}
-	kv.mu.Lock()
 	kv.clientReply[op.ClientId] = CommandContext{
 		CommandId: op.CommandId,
 		Reply:     applyResult,
 	}
-	kv.lastAppliedIndex = max(kv.lastAppliedIndex, msg.CommandIndex)
-	kv.mu.Unlock()
 }
 
 func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
 		kv.lastAppliedIndex = msg.SnapshotIndex
-		kv.kvdb.InstallSnapshot(msg.Snapshot)
+		kv.ReadSnapshot(msg.Snapshot)
 	}
 }
 
@@ -310,12 +312,34 @@ func (kv *KVServer) makeSnapshot() {
 		time.Sleep(time.Millisecond * 100)
 		kv.mu.Lock()
 		sizeNow := kv.rf.GetRaftStateSize()
-		DPrintf("Server[%d] Raft Size Is [%d] LastIncludeIndex [%d]", kv.me, sizeNow, kv.rf.GetLastIncludeIndex())
-		if sizeNow > kv.maxraftstate/2 {
+		// DPrintf("Server[%d] Raft Size Is [%d] LastIncludeIndex [%d]", kv.me, sizeNow, kv.rf.GetLastIncludeIndex())
+		if sizeNow > kv.maxraftstate && kv.maxraftstate != -1 {
 			DPrintf("Server[%d] Start to Make Snapshot", kv.me)
-			kv.rf.Snapshot(kv.lastAppliedIndex, kv.kvdb.GenSnapshot())
+			kv.rf.Snapshot(kv.lastAppliedIndex, kv.GenSnapshot())
 			DPrintf("Server[%d] Raft Size Is [%d] After Snapshot", kv.me, kv.rf.GetRaftStateSize())
 		}
 		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) GenSnapshot() []byte {
+	w := new(bytes.Buffer)
+	encode := gob.NewEncoder(w)
+	if encode.Encode(kv.clientReply) != nil ||
+		encode.Encode(kv.kvdb.KvData) != nil {
+		panic("Can't Generate Snapshot")
+		return nil
+	}
+	return w.Bytes()
+}
+func (kv *KVServer) ReadSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	encode := gob.NewDecoder(r)
+	if encode.Decode(&kv.clientReply) != nil ||
+		encode.Decode(&kv.kvdb.KvData) != nil {
+		panic("Can't Read Snapshot")
 	}
 }

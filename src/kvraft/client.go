@@ -62,6 +62,10 @@ func (ck *Clerk) Get(key string) string {
 		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
 			continue
 		}
+		if reply.Err == ErrOutDate {
+			panic("Outdated Request")
+		}
+		DPrintf("Client[%d] Success Get:[%v] ValueL[%v]", ck.clientId, args, reply.Value)
 		// 如果响应成功。
 		ck.lastFoundLeader = serverId
 		ck.lastAppliedCommandId = commandId
@@ -81,7 +85,6 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
 	commandId := ck.lastAppliedCommandId + 1
 	args := PutAppendArgs{
 		Key:       key,
@@ -95,11 +98,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	serverNum := len(ck.servers)
 	for ; ; serverId = (serverId + 1) % serverNum {
 		var reply PutAppendReply
-		DPrintf("Client Send [%v] PutAppend Op:[%v]", serverId, args)
+		DPrintf("Client[%d] Send [%v] PutAppend Op:[%v]", ck.clientId, serverId, args)
 		ok := ck.servers[serverId].Call("KVServer.PutAppend", &args, &reply)
 		if !ok || reply.Err == ErrWrongLeader || reply.Err == ErrTimeout {
+			DPrintf("Client Retry [%v] PutAppend Op:[%v]", (serverId+1)%serverNum, args)
 			continue
 		}
+		if reply.Err == ErrOutDate {
+			DPrintf("Client Retry [%v] PutAppend But Outdated", args)
+			return
+		}
+		DPrintf("Client[%d] Success PutAppend:[%v]", ck.clientId, args)
 		ck.lastFoundLeader = serverId
 		ck.lastAppliedCommandId = commandId
 		return

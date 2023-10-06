@@ -20,6 +20,7 @@ package raft
 import (
 	"6.824/labgob"
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 	rand2 "math/rand"
@@ -39,8 +40,8 @@ type IndexT int
 type statusT int
 
 const (
-	debug   bool = true
-	verbose bool = true
+	debug   bool = false
+	verbose bool = false
 )
 const (
 	follower statusT = iota
@@ -190,10 +191,10 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	lastIncludedIndex2 := IndexT(lastIncludedIndex)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//if lastIncludedIndex2 <= rf.commitIndex {
-	//	rf.logger.Printf("[%d] conflict when CondInstallSnapshot\nLast Include Index[%d]\tCommit Index[%d]\n", rf.me, lastIncludedIndex2, rf.commitIndex)
-	//	return false
-	//}
+	if lastIncludedIndex2 <= rf.GetLastIncludeIndex() {
+		rf.logger.Printf("[%d] conflict when CondInstallSnapshot\nLast Include Index[%d]\tCommit Index[%d]\n", rf.me, lastIncludedIndex2, rf.commitIndex)
+		return false
+	}
 	rf.logLatch.Lock()
 	defer rf.logLatch.Unlock()
 	if lastIncludedTerm == int(rf.getLastIncludeTerm()) && lastIncludedIndex == int(rf.GetLastIncludeIndex()) {
@@ -213,7 +214,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 		})
 	}
 	rf.snapshot = snapshot
-	rf.commitIndex = lastIncludedIndex2
+	rf.commitIndex = max(rf.commitIndex, lastIncludedIndex2)
 	rf.applyIndex = lastIncludedIndex2
 	rf.saveRaftStateAndSnapshot()
 	if debug {
@@ -747,6 +748,7 @@ func (rf *Raft) appendEntries(heartBeat bool) {
 				defer rf.logLatch.RUnlock()
 				if reply.Conflict {
 					if reply.XTerm != -1 {
+
 						lastIndexInXTerm := rf.getLastLogIndexInXTerm(reply.XTerm, int(reply.XIndex))
 						if debug {
 							rf.logger.Printf("Leader[%d] Logs:[\n%v]\n LastIndex In X Term: %d", rf.me, rf.logs, lastIndexInXTerm)
@@ -970,15 +972,21 @@ func (a appendEntryArgs) String() string {
 func (rf *Raft) getIthIndex(t IndexT) *Log {
 	idx := int(t) + rf.getLogOffset()
 	if idx >= len(rf.logs) {
-		rf.logger.Fatalf("Try get index [%d] Out of range\n", t)
+		var s string
+		fmt.Sprintf(s, "[%d] Try get index [%d] Out of range\n", rf.me, t)
+		panic(s)
 	}
 	return &rf.logs[idx]
 }
 
 // getLastLogIndexInXTerm 返回rf.logs在xTerm中最后一条log的下标
 // 如果完全没有xTerm,返回-1
+// 这里需要考虑，xTerm已经在log中的情况
 func (rf *Raft) getLastLogIndexInXTerm(xTerm termT, xIndex int) int {
 	idx := rf.getLogOffset() + xIndex
+	if idx < 0 {
+		return -1
+	}
 	if rf.logs[idx].Term != xTerm {
 		return -1
 	}

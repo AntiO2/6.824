@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"6.824/porcupine"
-	"log"
 )
 import "6.824/models"
 import "testing"
@@ -115,10 +114,10 @@ func spawn_clients_and_wait(t *testing.T, cfg *config, ncli int, fn func(me int,
 		ca[cli] = make(chan bool)
 		go run_client(t, cfg, cli, ca[cli], fn)
 	}
-	// log.Printf("spawn_clients_and_wait: waiting for clients")
+	// DPrintf("spawn_clients_and_wait: waiting for clients")
 	for cli := 0; cli < ncli; cli++ {
 		ok := <-ca[cli]
-		// log.Printf("spawn_clients_and_wait: client %d is done\n", cli)
+		// DPrintf("spawn_clients_and_wait: client %d is done\n", cli)
 		if ok == false {
 			t.Fatalf("failure")
 		}
@@ -250,7 +249,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 		clnts[i] = make(chan int)
 	}
 	for i := 0; i < 3; i++ {
-		log.Printf("Iteration %v\n", i)
+		DPrintf("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
 		DPrintf("Start")
@@ -278,7 +277,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 					if !randomkeys {
 						last = NextValue(last, nv)
 					}
-					DPrintf("%d: client putappend success", cli)
+					DPrintf("%d: client putappend success %v", cli, nv)
 					j++
 				} else if randomkeys && (rand.Int()%1000) < 100 {
 					// we only do this when using random keys, because it would break the
@@ -293,7 +292,9 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 					DPrintf("%d: client get return %v", cli, v)
 					// the following check only makes sense when we're not using random keys
 					if !randomkeys && v != last {
+
 						t.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
+						panic("haha")
 					}
 				}
 				DPrintf("done_clients==0")
@@ -312,7 +313,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
 
 		if partitions {
-			// log.Printf("wait for partitioner\n")
+			// DPrintf("wait for partitioner\n")
 			<-ch_partitioner
 			// reconnect network and submit a request. A client may
 			// have submitted a request in a minority.  That request
@@ -324,14 +325,14 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 		}
 
 		if crash {
-			// log.Printf("shutdown servers\n")
+			// DPrintf("shutdown servers\n")
 			for i := 0; i < nservers; i++ {
 				cfg.ShutdownServer(i)
 			}
 			// Wait for a while for servers to shutdown, since
 			// shutdown isn't a real crash and isn't instantaneous
 			time.Sleep(electionTimeout)
-			log.Printf("restart servers\n")
+			DPrintf("restart servers\n")
 			// crash and re-start all
 			for i := 0; i < nservers; i++ {
 				cfg.StartServer(i)
@@ -339,15 +340,15 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 			cfg.ConnectAll()
 		}
 
-		log.Printf("wait for clients\n")
+		DPrintf("wait for clients\n")
 		for i := 0; i < nclients; i++ {
-			log.Printf("read from clients %d\n", i)
+			DPrintf("read from clients %d\n", i)
 			j := <-clnts[i]
 			if j < 10 {
-				log.Printf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
+				DPrintf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
 			}
 			key := strconv.Itoa(i)
-			log.Printf("Check %v for client %d\n", j, i)
+			DPrintf("Check %v for client %d\n", j, i)
 			v := Get(cfg, ck, key, opLog, 0)
 			if !randomkeys {
 				checkClntAppends(t, i, v, j)
@@ -440,7 +441,10 @@ func TestConcurrent3A(t *testing.T) {
 	// Test: many clients (3A) ...
 	GenericTest(t, "3A", 5, 5, false, false, false, -1, false)
 }
-
+func TestOneClientUnreliable3A(t *testing.T) {
+	// Test: unreliable net, many clients (3A) ...
+	GenericTest(t, "3A", 1, 3, true, false, false, -1, false)
+}
 func TestUnreliable3A(t *testing.T) {
 	// Test: unreliable net, many clients (3A) ...
 	GenericTest(t, "3A", 5, 5, true, false, false, -1, false)
