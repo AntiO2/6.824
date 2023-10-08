@@ -554,3 +554,8 @@ if args.PrevLogIndex < lastIncludeIndex {
 当putappend重复时，也应当返回。这样client才能更新commandid
 
 因为在不可靠网络环境下，可能已经进行了更新操作，但是没有及时返回，clerk再次尝试请求，此时结果已经存放好了。
+
+
+
+![image-20231006164207915](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20231006164207915.png)
+
