@@ -730,3 +730,168 @@ for _, gid := range assignGids {
     }
 }
 ```
+
+## Part B: Sharded Key/Value Server
+
+构建一个shardkv system.
+
+使用提供的这个函数（类似于哈希）来决定某个key分配给哪个分片中。
+
+```go
+func key2shard(key string) int {
+    shard := 0
+    if len(key) > 0 {
+       shard = int(key[0])
+    }
+    shard %= shardctrler.NShards
+    return shard
+}
+```
+
+
+
+`shardctrler` 负责将分片分配给服务器（gid），当分配发生变化，分片在不同的组之间移动。
+
+实现应当提供线性一致性（在lab3中，这一特性通过raft提交get请求实现）。
+
+> A shardkv server is a member of only a single replica group. The set of servers in a given replica group will never change.
+
+一个shardkv **只能属于一个**replica group, 也就是说一个服务器不能同时属于多个group。第二句话意思是：一个服务器组中有哪些服务器是不会变的。
+
+> We supply you with `client.go` code that sends each RPC to the replica group responsible for the RPC's key. It re-tries if the replica group says it is not responsible for the key; in that case, the client code asks the shard controller for the latest configuration and tries again. You'll have to modify client.go as part of your support for dealing with duplicate client RPCs, much as in the kvraft lab.
+
+在client中，代码尝试将RPC发送给client **认为**负责任的group。如果该group实际上不负责这个key，那么就使用Lab4A里面的`Query(-1)`获取到该shard属于哪个gid的最新消息。
+
+
+
+### Basic
+
+#### Client
+
+初步设计clerk如下
+
+```go
+type Clerk struct {
+    sm       *shardctrler.Clerk
+    config   shardctrler.Config
+    make_end func(string) *labrpc.ClientEnd // 通过服务器名 （比如server1_a） 获得对应的client end
+    // You will have to modify this struct.
+    lastAppliedCommandId int         // 最后一次command的id
+    groupLeader          map[int]int // 缓存上次看到的某个gid对应的leader是谁。
+    clientId             int64       // 可以考虑复用sm clerk的id?
+}
+
+// the tester calls MakeClerk.
+//
+// ctrlers[] is needed to call shardctrler.MakeClerk().
+//
+// make_end(servername) turns a server name from a
+// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
+// send RPCs.
+func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
+    ck := new(Clerk)
+    ck.sm = shardctrler.MakeClerk(ctrlers)
+    ck.make_end = make_end
+    // You'll have to add code here.
+    ck.lastAppliedCommandId = 0
+    ck.clientId = nrand()
+    ck.config = shardctrler.Config{
+       Num:    0,
+       Shards: [10]int{},
+       Groups: nil,
+    }
+    ck.groupLeader = make(map[int]int)
+    return ck
+}
+```
+
+其中，config用于缓存上次看到的Config。ck.groupLeader用于缓存某个group对应的leader。
+
+
+
+然后和之前一样，在请求参数中添加clientid和commandId用于去除重复的RPC。
+
+```go
+ClientId  int64
+CommandId int
+```
+
+客户端的`PutAppend(key string, value string, op string) `和`Get(key string)`在已提供代码上增加clientId和commandId，以及优化一下leader查找就好。
+
+```go
+func (ck *Clerk) Get(key string) string {
+
+    commandId := ck.lastAppliedCommandId + 1
+    args := GetArgs{
+       Key:       key,
+       CommandId: commandId,
+       ClientId:  ck.clientId,
+    }
+    for {
+       shard := key2shard(key)
+       gid := ck.config.Shards[shard]
+       if servers, ok := ck.config.Groups[gid]; ok {
+          // try each server for the shard.
+          si := ck.groupLeader[gid] // 小优化： 使用上次发现的group leader
+          sn := len(servers)
+          for ; ; si = (si + 1) % sn {
+             srv := ck.make_end(servers[si])
+             var reply GetReply
+             ok := srv.Call("ShardKV.Get", &args, &reply)
+             if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+                ck.lastAppliedCommandId = commandId
+                ck.groupLeader[gid] = si
+                return reply.Value
+             }
+             if ok && (reply.Err == ErrWrongGroup) {
+                break
+             }
+             // ... not ok, or ErrWrongLeader
+          }
+       }
+       time.Sleep(100 * time.Millisecond)
+       // ask controler for the latest configuration.
+       ck.config = ck.sm.Query(-1)
+    }
+    return ""
+}
+
+// shared by Put and Append.
+// You will have to modify this function.
+func (ck *Clerk) PutAppend(key string, value string, op string) {
+    commandId := ck.lastAppliedCommandId + 1
+    args := PutAppendArgs{
+       Key:       key,
+       Value:     value,
+       Op:        op,
+       ClientId:  ck.clientId,
+       CommandId: commandId,
+    }
+
+    for {
+       shard := key2shard(key)
+       gid := ck.config.Shards[shard]
+       if servers, ok := ck.config.Groups[gid]; ok {
+          si := ck.groupLeader[gid] // 小优化： 使用上次发现的group leader
+          sn := len(servers)
+          for ; ; si = (si + 1) % sn {
+             srv := ck.make_end(servers[si])
+             var reply PutAppendReply
+             ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+             if ok && reply.Err == OK {
+                ck.lastAppliedCommandId = commandId
+                ck.groupLeader[gid] = si
+                return
+             }
+             if ok && reply.Err == ErrWrongGroup {
+                break
+             }
+             // ... not ok, or ErrWrongLeader
+          }
+       }
+       time.Sleep(100 * time.Millisecond)
+       // ask controler for the latest configuration.
+       ck.config = ck.sm.Query(-1)
+    }
+}
+```
