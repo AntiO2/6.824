@@ -10,7 +10,7 @@ import "6.824/labrpc"
 import "sync"
 import "6.824/labgob"
 
-const Debug = true
+const Debug = false
 const scTimeOut = 500 * time.Millisecond
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {

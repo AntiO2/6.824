@@ -1,6 +1,11 @@
 package shardkv
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"6.824/shardctrler"
+	"sync/atomic"
+	"time"
+)
 import "6.824/raft"
 import "sync"
 import "6.824/labgob"
@@ -9,26 +14,182 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OpType string
+	Data   interface{}
 }
-
+type DataArgs struct {
+	Key       string
+	Value     string
+	ClientId  int64
+	CommandId int
+}
+type ApplyResult struct {
+	ErrMsg Err
+	Value  string
+	Term   int
+}
+type CommandContext struct {
+	CommandId int
+	Reply     ApplyResult
+}
+type ShardData struct {
+	ShardNum    int                      // shard的编号
+	KvDB        KvDataBase               // 数据库
+	clientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
+}
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
-	make_end     func(string) *labrpc.ClientEnd
+	makeEnd      func(string) *labrpc.ClientEnd
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
 	// Your definitions here.
+	shardData        [shardctrler.NShards]ShardData
+	replyChMap       map[int]chan ApplyResult // log的index对应的返回信息。
+	lastAppliedIndex int                      // kv数据库中最后应用的index.
+	mck              *shardctrler.Clerk
+	dead             int32
+	cfg              shardctrler.Config
+	migratingShard   [shardctrler.NShards]bool
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	shard := key2shard(args.Key)
+	if kv.cfg.Shards[shard] != kv.gid {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	if clientReply, ok := kv.shardData[shard].clientReply[args.ClientId]; ok {
+		if args.CommandId == clientReply.CommandId {
+			reply.Value = clientReply.Reply.Value
+			reply.Err = clientReply.Reply.ErrMsg
+			kv.mu.Unlock()
+			return
+		} else if args.CommandId < clientReply.CommandId {
+			reply.Err = ErrOutDate // 已经没有了之前执行的记录。
+			kv.mu.Unlock()
+			return
+		}
+	}
+	kv.mu.Unlock()
+	op := Op{
+		OpType: GetOperation,
+		Data: DataArgs{
+			Key:       args.Key,
+			Value:     "",
+			CommandId: args.CommandId,
+			ClientId:  args.ClientId},
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("Leader[%d] Receive Op\t:%v\tIndex[%d]", kv.me, op, index)
+	replyCh := make(chan ApplyResult, 1)
+	kv.mu.Lock()
+	kv.replyChMap[index] = replyCh
+	kv.mu.Unlock()
+	select {
+	case replyMsg := <-replyCh:
+		{
+			if term != replyMsg.Term {
+				// 已经进入之后的term，leader改变（当前server可能仍然是leader，但是已经是几个term之后了）
+				reply.Err = ErrWrongLeader
+				return
+			} else {
+				reply.Value = replyMsg.Value
+				reply.Err = replyMsg.ErrMsg
+			}
+		}
+	case <-time.After(KVTimeOut):
+		{
+			reply.Err = ErrWrongLeader
+			return
+		}
+	}
+	go kv.CloseIndexCh(index)
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	DPrintf("Server [%d] Receive Request\t:%v", kv.me, args)
+	kv.mu.Lock()
+	shard := key2shard(args.Key)
+	if kv.cfg.Shards[shard] != kv.gid {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	if clientReply, ok := kv.shardData[shard].clientReply[args.ClientId]; ok {
+		if args.CommandId == clientReply.CommandId {
+			DPrintf("Server [%d] Receive Same Command [%d]", kv.me, args.CommandId)
+			kv.mu.Unlock()
+			return
+		} else if args.CommandId < clientReply.CommandId {
+			DPrintf("Server  [%d] Receive OutDate Command [%d]", kv.me, args.CommandId)
+			reply.Err = ErrOutDate // 已经没有了之前执行的记录。
+			kv.mu.Unlock()
+			return
+		}
+	}
+	kv.mu.Unlock()
+	op := Op{
+		OpType: args.Op,
+		Data: DataArgs{
+			Key:       args.Key,
+			Value:     args.Value,
+			CommandId: args.CommandId,
+			ClientId:  args.ClientId},
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		DPrintf("Client[%d] Isn't Leader", kv.me)
+		return
+	}
+	DPrintf("Leader[%d] Receive Op\t:%v\tIndex[%d]", kv.me, op, index)
+	replyCh := make(chan ApplyResult, 1)
+	kv.mu.Lock()
+	kv.replyChMap[index] = replyCh
+	kv.mu.Unlock()
+	select {
+	case replyMsg := <-replyCh:
+		{
+			if term != replyMsg.Term {
+				// 已经进入之后的term，leader改变（当前server可能仍然是leader，但是已经是几个term之后了）
+				reply.Err = ErrWrongLeader
+			} else {
+				reply.Err = replyMsg.ErrMsg
+			}
+		}
+	case <-time.After(KVTimeOut):
+		{
+			reply.Err = ErrWrongLeader
+			return
+		}
+	}
+	go kv.CloseIndexCh(index)
+}
+func (kv *ShardKV) CloseIndexCh(index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	indexCh, ok := kv.replyChMap[index]
+	if !ok {
+		return
+	}
+	close(indexCh)
+	delete(kv.replyChMap, index)
+	return
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -38,6 +199,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&kv.dead, 1)
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -57,12 +219,12 @@ func (kv *ShardKV) Kill() {
 // pass ctrlers[] to shardctrler.MakeClerk() so you can send
 // RPCs to the shardctrler.
 //
-// make_end(servername) turns a server name from a
+// makeEnd(servername) turns a server name from a
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs. You'll need this to send RPCs to other groups.
 //
 // look at client.go for examples of how to use ctrlers[]
-// and make_end() to send RPCs to the group owning a specific shard.
+// and makeEnd() to send RPCs to the group owning a specific shard.
 //
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
@@ -70,21 +232,179 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
-
+	labgob.Register(shardctrler.Config{})
+	labgob.Register(DataArgs{})
 	kv := new(ShardKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-	kv.make_end = make_end
+	kv.makeEnd = make_end
 	kv.gid = gid
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
 
 	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.replyChMap = make(map[int]chan ApplyResult)
+	kv.cfg = kv.mck.Query(-1)
+	for i := 0; i < 10; i++ {
+		kv.shardData[i] = ShardData{}
+		kv.shardData[i].ShardNum = i
+		kv.shardData[i].KvDB.Init()
+		kv.shardData[i].clientReply = make(map[int64]CommandContext)
+	}
+
+	go kv.handleApplyMsg()
+	go kv.daemon(kv.fetchNewConfig)
 
 	return kv
+}
+func (kv *ShardKV) handleApplyMsg() {
+	for !kv.killed() {
+		applyMsg := <-kv.applyCh
+
+		if applyMsg.CommandValid {
+			kv.applyCommand(applyMsg)
+			continue
+		}
+		if applyMsg.SnapshotValid {
+			// kv.applySnapshot(applyMsg)
+			continue
+		}
+		DPrintf("Error Apply Msg: [%v]", applyMsg)
+	}
+}
+
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+func (kv *ShardKV) applyCommand(msg raft.ApplyMsg) {
+	op := msg.Command.(Op)
+	switch op.OpType {
+	case GetOperation:
+		kv.applyDBModify(msg)
+	case PutOperation:
+		kv.applyDBModify(msg)
+	case AppendOperation:
+		kv.applyDBModify(msg)
+	case NewConfig:
+		kv.applyNewConfig(op.Data.(shardctrler.Config))
+	default:
+		DPrintf("ERROR OP TYPE:%s", op.OpType)
+	}
+}
+func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
+	var applyResult ApplyResult
+	op := msg.Command.(Op)
+	applyResult.Term = msg.CommandTerm
+	args := op.Data.(DataArgs)
+	shardNum := key2shard(args.Key)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	commandContext, ok := kv.shardData[shardNum].clientReply[args.ClientId]
+	if ok && commandContext.CommandId >= args.CommandId {
+		// 该指令已经被应用过。
+		// applyResult = commandContext.Reply
+		return
+	}
+	switch op.OpType {
+	case GetOperation:
+		{
+			value, ok := kv.shardData[shardNum].KvDB.Get(args.Key)
+			DPrintf("Server[%d.%d] Get K[%v] V[%v] From Shard[%d]", kv.gid, kv.me, args.Key, value, shardNum)
+			if ok {
+				applyResult.Value = value
+				applyResult.ErrMsg = OK
+			} else {
+				applyResult.Value = ""
+				applyResult.ErrMsg = ErrNoKey
+			}
+		}
+	case PutOperation:
+		{
+			value := kv.shardData[shardNum].KvDB.Put(args.Key, args.Value)
+			DPrintf("Server[%d.%d] Put K[%v] V[%v] To Shard[%d]", kv.gid, kv.me, args.Key, args.Value, shardNum)
+			applyResult.Value = value
+			applyResult.ErrMsg = OK
+		}
+	case AppendOperation:
+		{
+			value := kv.shardData[shardNum].KvDB.Append(args.Key, args.Value)
+			DPrintf("Server[%d.%d] Append K[%v] V[%v] To Shard[%d]", kv.gid, kv.me, args.Key, args.Value, shardNum)
+			applyResult.Value = value
+			applyResult.ErrMsg = OK
+		}
+	default:
+		DPrintf("Error Op Type %s", op.OpType)
+	}
+	kv.lastAppliedIndex = msg.CommandIndex
+	ch, ok := kv.replyChMap[msg.CommandIndex]
+	if ok {
+		ch <- applyResult
+	}
+	kv.shardData[shardNum].clientReply[args.ClientId] = CommandContext{
+		CommandId: args.CommandId,
+		Reply:     applyResult,
+	}
+}
+func (kv *ShardKV) applyNewConfig(config shardctrler.Config) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if config.Num <= kv.cfg.Num {
+		return
+	}
+	for shard := 0; shard < shardctrler.NShards; shard++ {
+		if kv.migratingShard[shard] {
+			// 还有迁移没有完成
+			return
+		}
+	}
+	kv.lockMigratingShards(config.Shards)
+	DPrintf("Server [%d.%d] Convert [%d]To new Config :[%v]", kv.gid, kv.me, kv.cfg.Num, config)
+	kv.cfg = config
+}
+func (kv *ShardKV) fetchNewConfig() {
+	newCfg := kv.mck.Query(-1)
+	if newCfg.Num > kv.cfg.Num {
+		// 配置发生了变化，检查自己不负责哪些shard了。
+		op := Op{
+			OpType: NewConfig,
+			Data:   newCfg,
+		}
+		kv.mu.Lock()
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			kv.rf.Start(op)
+		}
+		kv.mu.Unlock()
+	}
+}
+func (kv *ShardKV) daemon(action func()) {
+	for !kv.killed() {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			action()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) lockMigratingShards(newShards [10]int) {
+	oldShards := kv.cfg.Shards
+	for shard, gid := range oldShards {
+		if gid == kv.gid && newShards[shard] != kv.gid {
+			// 本来该shard由本group负责， 但是现在应该迁移给别人
+			if newShards[shard] != 0 {
+				kv.migratingShard[shard] = true
+			}
+		}
+		if newShards[shard] == kv.gid && gid != kv.gid {
+			// 从别的shard迁移过来
+			if gid != 0 {
+				kv.migratingShard[shard] = true
+			}
+		}
+	}
 }

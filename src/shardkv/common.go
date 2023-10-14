@@ -1,19 +1,37 @@
 package shardkv
 
-//
+import (
+	"log"
+	"time"
+)
+
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
 // Shardctrler decides which group serves each shard.
 // Shardctrler may change shard assignment from time to time.
 //
 // You will have to modify these definitions.
-//
 
+const Debug = true
+
+func DPrintf(format string, a ...interface{}) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+const KVTimeOut = 500 * time.Millisecond
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK              = "OK"
+	ErrNoKey        = "ErrNoKey"
+	ErrWrongGroup   = "ErrWrongGroup"
+	ErrWrongLeader  = "ErrWrongLeader"
+	PutOperation    = "Put"
+	GetOperation    = "Get"
+	AppendOperation = "Append"
+	ErrOutDate      = "ErrOutDate"
+	NewConfig       = "NewConfig"
 )
 
 type Err string

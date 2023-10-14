@@ -895,3 +895,103 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
     }
 }
 ```
+
+### Server
+
+首先把Lab3中的KVserver复制过来。接下来要考虑：服务器如何知道当前是否对某个shard负责？
+
+> Your server will need to periodically poll the shardctrler to learn about new configurations. The tests expect that your code polls roughly every 100 milliseconds; more often is OK, but much less often may cause problems.
+
+启动一个协程，周期性地询问配置，如果观察到发生了改变，进行move shard操作。
+
+在Server的Get和PutAppend操作前面，加上判断是否有该Shard的操作：
+
+```go
+shard := key2shard(args.Key)
+if kv.cfg.Shards[shard] != kv.gid {
+    reply.Err = ErrWrongGroup
+    return
+}
+```
+
+#### 发现新Config
+
+如果观察到配置移动怎么办呢？
+
+首先，肯定不能一观察到分区移动就立刻进行移动操作。
+
+考虑这么一种情况：
+
+- 客户端已经发送5个put请求并得到返回。
+- 一旦put请求得到返回，说明已经被apply了。
+- 如果有已经commit但是还没有apply的log，并且这些log包含将要被移动的分区。那么如果在此时发送数据给新负责的服务器组，是不包含这些commit的数据的。但是在之后这些log又会被apply，导致丢失数据。
+
+另一种情景：
+
+- 假如group一开始不负责key=1。在某个时刻修改配置。
+- 此时map中没有key=1的键值对
+- 一个新请求到达，请求get key=1
+- 返回出错，因为其他group可能还没有来得及发送key=1的键值对给该group。
+
+
+
+另一个问题：group中的follower需要观察config变化吗？
+
+应该是不需要的。leader观察，然后通过log的方式同步就行了。
+
+
+
+```go
+func (kv *ShardKV) fetchNewConfig() {
+    newCfg := kv.mck.Query(-1)
+    if newCfg.Num != kv.cfg.Num {
+       // 配置发生了变化，检查自己不负责哪些shard了。
+       op := Op{
+          OpType: NewConfig,
+          Data:   newCfg,
+       }
+       kv.mu.Lock()
+       if _, isLeader := kv.rf.GetState(); isLeader {
+          kv.rf.Start(op)
+       }
+       kv.mu.Unlock()
+    }
+}
+func (kv *ShardKV) daemon(action func()) {
+    for !kv.killed() {
+       if _, isLeader := kv.rf.GetState(); isLeader {
+          action()
+       }
+       time.Sleep(100 * time.Millisecond)
+    }
+}
+```
+
+
+
+
+
+#### 改变分片存储方式
+
+那么分片移动时，应当包含哪些数据呢？
+
+考虑一个情景：
+
+- 存在Group1,Group2。Group1一开始负责分片1.
+- Client发送Append给G1，G1成功将这个键值对应用到KVDB中，但是回复给Client的信息丢包了。
+- 分片1从G1转移到G2。
+- Client再次尝试Put，G1回复ERR_GROUP。于是Client更新配置。并且发送Append操作给G2。
+- 如果不改进我们的Server的话，就出现重复Append的问题了。
+- 所以分片数据也应当包含对客户端的回复。
+
+```go
+type ShardData struct {
+    ShardNum    int                      // shard的编号
+    KvDB        KvDataBase               // 数据库
+    clientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
+}
+```
+
+当分片移动时，不仅仅是键值对，保存的回复也应当移动到新的group。
+
+### 
