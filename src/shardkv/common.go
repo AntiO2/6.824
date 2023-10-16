@@ -23,15 +23,31 @@ func DPrintf(format string, a ...interface{}) {
 
 const KVTimeOut = 500 * time.Millisecond
 const (
-	OK              = "OK"
-	ErrNoKey        = "ErrNoKey"
-	ErrWrongGroup   = "ErrWrongGroup"
-	ErrWrongLeader  = "ErrWrongLeader"
-	PutOperation    = "Put"
-	GetOperation    = "Get"
-	AppendOperation = "Append"
-	ErrOutDate      = "ErrOutDate"
-	NewConfig       = "NewConfig"
+	OK             Err = "OK"
+	ErrNoKey           = "ErrNoKey"
+	ErrWrongGroup      = "ErrWrongGroup"
+	ErrWrongLeader     = "ErrWrongLeader"
+	ErrOutDate         = "ErrOutDate"
+)
+
+type OpTypeT string
+
+const (
+	NewConfig       OpTypeT = "NewConfig"
+	PutOperation            = "Put"
+	GetOperation            = "Get"
+	AppendOperation         = "Append"
+	PullNewData             = "PullNewData"
+)
+
+type ShardStatus string
+
+const (
+	Invalid      ShardStatus = "Invalid"
+	Serving                  = "Serving"
+	Pulling                  = "Pulling"
+	WaitPull                 = "WaitPull"
+	ServingButGC             = "ServingButGC"
 )
 
 type Err string

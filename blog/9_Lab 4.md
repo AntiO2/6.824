@@ -916,7 +916,7 @@ if kv.cfg.Shards[shard] != kv.gid {
 
 #### 发现新Config
 
-如果观察到配置移动怎么办呢？
+如果观察到配置改变怎么办呢？
 
 首先，肯定不能一观察到分区移动就立刻进行移动操作。
 
@@ -992,6 +992,58 @@ type ShardData struct {
 }
 ```
 
-当分片移动时，不仅仅是键值对，保存的回复也应当移动到新的group。
+所以当分片移动时，不仅仅是键值对，保存的回复也应当移动到新的group。
 
-### 
+#### 分片迁移
+
+这里我们只先考虑： Group A的某个分片（这里叫作s1）需要迁移到Group B。并且Group A不会清理s1。
+
+书接**apply 新config **, 此时，不再属于A的分片已经对外不可用了。如果B发现了自己应该应用该分片，也暂时不能再提供该分片，直到A发送S1给B。
+
+此时我们有两种思路：
+
+1. `A.leader`启动一个daemon，发现了应当发送的S1，并**push**给B
+2. `B.leader`的daemon发现自己缺少S1，向A发送**pull**请求。
+
+感觉这两种其实差不多的。第一种，如果一开始没找到B的leader，会发送多个包含数据的RPC。第二种，如果一开始没Pull到A的leader，再次发送的RPC包只包含请求的shard编号信息和config编号。所以我感觉pull的方式可能要好些。
+
+
+
+这里先设计了几个状态。
+
+|                       | Server目前负责shard | Server目前不负责该shard        |
+| --------------------- | ------------------- | ------------------------------ |
+| Server目前拥有shard   | 正常服务。          | config改变，该server等待被pull |
+| Server目前没有该shard | 尝试Pull其他Server  | 与我无关                       |
+
+目前还没有引入垃圾回收，所以Server暂时不需要清理已经被Pull的分片。
+
+```go
+type ShardStatus string
+
+const (
+    Serving  ShardStatus = "Serving"
+    Pulling              = "Pulling"
+    WaitPull             = "WaitPull"
+    Invalid              = "Invalid"
+	ServingButGC         = "ServingButGC"
+)
+```
+
+
+
+然后Pull Data协程定时查看目前还有哪些分片没有，向对应的GID发起Pull请求。注意，Pull到之后也应该将Data通过Log的形式发送给Raft。Raft Apply这个包含分区的log之后，就可以将状态从Pulling转移到Serving了。
+
+但是之前拥有这个Shard的Server如何处理WaitPull状态呢。首先，WaitPull的shard被其他服务器Pull后，因为可能丢包，不能直接从WaitPull状态转移到Invalid状态。而是应当等到Group B(发起pull的Server)确认已经应用新分片，然后就能彻底清理这个分片。
+
+在此期间，Group B是处于`ServingButGC`状态， 表示虽然目前可以用这个分片了，但是还没有通知A ：“我已经收到了”。所以Group B还要定时检查这个状态的。
+
+现在A收到了清理请求，并在RAFT中Apply了，问题来了，如何告诉Group B已经清理掉了呢？单纯回复是不靠谱的。因为可能丢包，A也可能重复垃圾清理。应当使用类似于对Clerk去重的机制。**保存对其他Group的清理请求**。
+
+
+
+## 一点建议
+
+1. 在最开始，先不要考虑太多。比如一开始就想网络分区会怎么办，延迟会怎么办，重启会怎么办？同时思考会导致思路挺乱。不要怕代码重构。
+2. 每完成一点代码，可能之前测试通过的功能会出现bug，先保证之前的正确。
+

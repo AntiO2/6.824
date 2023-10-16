@@ -14,7 +14,7 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	OpType string
+	OpType OpTypeT
 	Data   interface{}
 }
 type DataArgs struct {
@@ -38,7 +38,7 @@ type ShardData struct {
 	clientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
 }
 type ShardKV struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -53,7 +53,8 @@ type ShardKV struct {
 	mck              *shardctrler.Clerk
 	dead             int32
 	cfg              shardctrler.Config
-	migratingShard   [shardctrler.NShards]bool
+	prevCfg          shardctrler.Config // 之前的cfg
+	shardStatus      [shardctrler.NShards]ShardStatus
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -61,7 +62,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	shard := key2shard(args.Key)
 	if kv.cfg.Shards[shard] != kv.gid {
+		// 目前不负责该shard
 		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	if kv.shardStatus[shard] != Serving {
+		// 目前负责该shard，但是还没有准备好。（pulling状态）
+		reply.Err = ErrWrongLeader
 		kv.mu.Unlock()
 		return
 	}
@@ -129,6 +137,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
+	if kv.shardStatus[shard] != Serving {
+		// 目前负责该shard，但是还没有准备好。（pulling状态）
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
 	if clientReply, ok := kv.shardData[shard].clientReply[args.ClientId]; ok {
 		if args.CommandId == clientReply.CommandId {
 			DPrintf("Server [%d] Receive Same Command [%d]", kv.me, args.CommandId)
@@ -143,7 +157,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.mu.Unlock()
 	op := Op{
-		OpType: args.Op,
+		OpType: OpTypeT(args.Op),
 		Data: DataArgs{
 			Key:       args.Key,
 			Value:     args.Value,
@@ -255,11 +269,12 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		kv.shardData[i].ShardNum = i
 		kv.shardData[i].KvDB.Init()
 		kv.shardData[i].clientReply = make(map[int64]CommandContext)
+		kv.shardStatus[i] = Invalid
 	}
 
 	go kv.handleApplyMsg()
 	go kv.daemon(kv.fetchNewConfig)
-
+	go kv.daemon(kv.pullData)
 	return kv
 }
 func (kv *ShardKV) handleApplyMsg() {
@@ -284,6 +299,10 @@ func (kv *ShardKV) killed() bool {
 }
 func (kv *ShardKV) applyCommand(msg raft.ApplyMsg) {
 	op := msg.Command.(Op)
+	if msg.CommandIndex <= kv.lastAppliedIndex {
+		// 按理说不应该发生这种情况
+		return
+	}
 	switch op.OpType {
 	case GetOperation:
 		kv.applyDBModify(msg)
@@ -355,16 +374,18 @@ func (kv *ShardKV) applyNewConfig(config shardctrler.Config) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if config.Num <= kv.cfg.Num {
+		DPrintf("[%d]Try Apply Outdated Config[%d]", kv.me, config.Num)
 		return
 	}
 	for shard := 0; shard < shardctrler.NShards; shard++ {
-		if kv.migratingShard[shard] {
+		if kv.shardStatus[shard] != Serving && kv.shardStatus[shard] != Invalid {
 			// 还有迁移没有完成
 			return
 		}
 	}
-	kv.lockMigratingShards(config.Shards)
+	kv.updateShardsStatus(config.Shards)
 	DPrintf("Server [%d.%d] Convert [%d]To new Config :[%v]", kv.gid, kv.me, kv.cfg.Num, config)
+	kv.prevCfg = kv.cfg
 	kv.cfg = config
 }
 func (kv *ShardKV) fetchNewConfig() {
@@ -382,6 +403,51 @@ func (kv *ShardKV) fetchNewConfig() {
 		kv.mu.Unlock()
 	}
 }
+
+// 守护进程，负责获取新config的分区
+func (kv *ShardKV) pullData() {
+
+	wg := sync.WaitGroup{}
+	kv.mu.RLock()
+	pullingShards := kv.getTargetGidAndShardsByStatus(Pulling)
+	for gid, shards := range pullingShards {
+		wg.Add(1)
+		go func(config shardctrler.Config, gid int, shards []int) {
+			defer wg.Done()
+			servers := config.Groups[gid]
+			args := PullDataArgs{
+				PulledShard: shards,
+				ConfigNum:   config.Num,
+				Gid:         kv.me,
+			}
+			for _, server := range servers {
+				var reply PullDataReply
+				if ok := kv.makeEnd(server).Call("ShardKV. PullData", &args, &reply); ok && reply.ErrMsg == OK {
+					kv.rf.Start(Op{
+						OpType: Pulling,
+						Data:   reply.Data,
+					})
+				}
+			}
+		}(kv.cfg, gid, shards)
+	}
+	kv.mu.RUnlock()
+	wg.Wait()
+}
+
+type PullDataArgs struct {
+	PulledShard []int // 需要拉取的shards
+	ConfigNum   int   // 请求group的版本号。
+	Gid         int   // 请求group的id
+}
+type PullDataReply struct {
+	Data   []ShardData
+	ErrMsg Err
+}
+
+func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
+
+}
 func (kv *ShardKV) daemon(action func()) {
 	for !kv.killed() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
@@ -391,20 +457,46 @@ func (kv *ShardKV) daemon(action func()) {
 	}
 }
 
-func (kv *ShardKV) lockMigratingShards(newShards [10]int) {
+func (kv *ShardKV) updateShardsStatus(newShards [10]int) {
 	oldShards := kv.cfg.Shards
 	for shard, gid := range oldShards {
 		if gid == kv.gid && newShards[shard] != kv.gid {
 			// 本来该shard由本group负责， 但是现在应该迁移给别人
 			if newShards[shard] != 0 {
-				kv.migratingShard[shard] = true
+				kv.shardStatus[shard] = WaitPull
 			}
 		}
 		if newShards[shard] == kv.gid && gid != kv.gid {
 			// 从别的shard迁移过来
 			if gid != 0 {
-				kv.migratingShard[shard] = true
+				kv.shardStatus[shard] = Pulling
 			}
 		}
 	}
+}
+
+/*
+*	根据目前指定的状态，指定之前的GID.
+*
+* 	比如目前的配置是：shard[5] = {1,1,1,1,3} ,kv.me = 101
+* 	shardStatus[5] = {serving, pulling, pulling, pulling, invalid}
+* 	可能第1，2个分片（从0开始）需要从Group102拉取，第3个分片应当从Group103拉取。
+*	那么返回map:[{102,[1,2]},{103,[3]}]
+ */
+func (kv *ShardKV) getTargetGidAndShardsByStatus(targetStatus ShardStatus) map[int][]int {
+	result := make(map[int][]int)
+	for shardIndex, shardStatus := range kv.shardStatus {
+		if shardStatus == targetStatus {
+			prevGid := kv.prevCfg.Shards[shardIndex]
+			if prevGid != 0 {
+				// 找到之前的GID，并加入shard编号
+				shards, ok := result[prevGid]
+				if !ok {
+					shards = make([]int, 0)
+				}
+				shards = append(shards, shardIndex) // todo 检查这里改变切片是否有效
+			}
+		}
+	}
+	return result
 }
