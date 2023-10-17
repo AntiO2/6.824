@@ -61,7 +61,8 @@ type ShardKV struct {
 	// Your definitions here.
 	shardData        [shardctrler.NShards]ShardData
 	replyChMap       map[int]chan ApplyResult // log的index对应的返回信息。
-	lastAppliedIndex int                      // kv数据库中最后应用的index.
+	gcReplyMap       map[int]GCReply
+	lastAppliedIndex int // kv数据库中最后应用的index.
 	mck              *shardctrler.Clerk
 	dead             int32
 	cfg              shardctrler.Config
@@ -323,9 +324,13 @@ func (kv *ShardKV) applyCommand(msg raft.ApplyMsg) {
 	case AppendOperation:
 		kv.applyDBModify(msg)
 	case NewConfig:
-		kv.applyNewConfig(op.Data.(shardctrler.Config))
+		kv.applyNewConfig(msg.CommandIndex, op.Data.(shardctrler.Config))
 	case PullNewData:
-		kv.applyShard(op.Data.(PullDataReply))
+		kv.applyShard(msg.CommandIndex, op.Data.(PullDataReply))
+	case ConfirmGC:
+		kv.applyConfirmGC(msg)
+	case ConfirmPull:
+		kv.applyConfirmPull(msg)
 	default:
 		DPrintf("ERROR OP TYPE:%s", op.OpType)
 	}
@@ -384,7 +389,7 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 		Reply:     applyResult,
 	}
 }
-func (kv *ShardKV) applyNewConfig(config shardctrler.Config) {
+func (kv *ShardKV) applyNewConfig(idx int, config shardctrler.Config) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if config.Num <= kv.cfg.Num {
@@ -401,6 +406,7 @@ func (kv *ShardKV) applyNewConfig(config shardctrler.Config) {
 	DPrintf("Server [%d.%d] Convert [%d]To new Config :[%v]", kv.gid, kv.me, kv.cfg.Num, config)
 	kv.prevCfg = kv.cfg
 	kv.cfg = config
+	kv.lastAppliedIndex = idx
 }
 func (kv *ShardKV) fetchNewConfig() {
 	newCfg := kv.mck.Query(-1)
@@ -435,7 +441,7 @@ func (kv *ShardKV) pullData() {
 			}
 			for _, server := range servers {
 				var reply PullDataReply
-				if ok := kv.makeEnd(server).Call("ShardKV. PullData", &args, &reply); ok && reply.ErrMsg == OK {
+				if ok := kv.makeEnd(server).Call("ShardKV.PullData", &args, &reply); ok && reply.ErrMsg == OK {
 					kv.rf.Start(Op{
 						OpType: PullNewData,
 						Data:   reply,
@@ -490,6 +496,10 @@ func (kv *ShardKV) daemon(action func()) {
 	}
 }
 
+/*
+*
+更新分片的状态。
+*/
 func (kv *ShardKV) updateShardsStatus(newShards [10]int) {
 	oldShards := kv.cfg.Shards
 	for shard, gid := range oldShards {
@@ -534,16 +544,16 @@ func (kv *ShardKV) getTargetGidAndShardsByStatus(targetStatus ShardStatus) map[i
 	return result
 }
 
-func (kv *ShardKV) applyShard(reply PullDataReply) {
-	kv.mu.RLock()
-	defer kv.mu.RUnlock()
+func (kv *ShardKV) applyShard(idx int, reply PullDataReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	if reply.ConfigNum == kv.cfg.Num {
 		for _, shardData := range reply.Data {
 			kv.shardData[shardData.ShardNum] = shardData.clone()
 			kv.shardStatus[shardData.ShardNum] = ServingButGC
 		}
 	}
-	DPrintf("Try To Apply OutDated Config [%d]", reply.ConfigNum)
+	kv.lastAppliedIndex = idx
 	return
 }
 
@@ -564,11 +574,12 @@ func (kv *ShardKV) garbageCollector() {
 			}
 			for _, server := range servers {
 				var reply GCReply
-				if ok := kv.makeEnd(server).Call("ShardKV. PullData", &args, &reply); ok && reply.ErrMsg == OK {
+				if ok := kv.makeEnd(server).Call("ShardKV.GCHandler", &args, &reply); ok && reply.ErrMsg == OK {
 					kv.rf.Start(Op{
 						OpType: ConfirmGC,
-						Data:   reply,
+						Data:   args,
 					})
+					return
 				}
 			}
 		}(kv.cfg, gid, shards)
@@ -587,9 +598,13 @@ type GCReply struct {
 	ErrMsg    Err
 }
 
-func (kv *ShardKV) GCHandler(args *PullDataArgs, reply *PullDataReply) {
-	kv.mu.RLock()
-	defer kv.mu.RUnlock() // todo 这里能否优化为细粒度锁?
+func (kv *ShardKV) GCHandler(args *GCArgs, reply *GCReply) {
+	kv.mu.Lock()
+	if prevReply, ok := kv.gcReplyMap[args.Gid]; ok && (prevReply.ErrMsg == OK) && (prevReply.ConfigNum == args.ConfigNum) {
+		reply.ErrMsg = OK
+		reply.ConfigNum = args.ConfigNum
+		return
+	}
 	if _, isleader := kv.rf.GetState(); !isleader {
 		reply.ErrMsg = ErrWrongLeader
 		return
@@ -599,13 +614,85 @@ func (kv *ShardKV) GCHandler(args *PullDataArgs, reply *PullDataReply) {
 		return
 	}
 	if args.ConfigNum < kv.cfg.Num {
-		// 不太可能发生这种情况，因为如果shard没有完全同步，不会切换为下一个config
-		panic(ErrOutDate)
+		// 不太可能发生这种情况，因为如果shard group没有完全同步，不会切换为下一个config
+		// 可能出现在重启的情况中？
+		reply.ErrMsg = ErrOutDate
+		return
 	}
-	for _, shard := range args.PulledShard {
-		reply.Data = append(reply.Data, kv.shardData[shard])
+	index, currentTerm, isleader := kv.rf.Start(Op{
+		OpType: ConfirmPull,
+		Data:   *args,
+	})
+	if !isleader {
+		reply.ErrMsg = ErrWrongLeader
+		return
 	}
-	reply.ErrMsg = OK
-	reply.ConfigNum = kv.cfg.Num
+	applyCh := make(chan ApplyResult, 1)
+	kv.replyChMap[index] = applyCh
+	kv.mu.Unlock()
+
+	select {
+	case replyMsg := <-applyCh:
+		{
+			if currentTerm != replyMsg.Term {
+				// 已经进入之后的term，leader改变（当前server可能仍然是leader，但是已经是几个term之后了）
+				// 说明执行的结果不是同一个log的
+				reply.ErrMsg = ErrWrongLeader
+				return
+			} else {
+				reply.ConfigNum = args.ConfigNum
+				reply.ErrMsg = OK
+			}
+		}
+	case <-time.After(500 * time.Millisecond):
+		{
+			reply.ErrMsg = ErrWrongLeader
+		}
+	}
+	go kv.CloseIndexCh(index)
+}
+func (kv *ShardKV) applyConfirmGC(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	op := msg.Command.(Op)
+	args := op.Data.(GCArgs)
+	if args.ConfigNum == args.ConfigNum {
+		for _, shard := range args.GCShard {
+			kv.shardStatus[shard] = Serving
+		}
+		return
+	}
+	DPrintf("Try To Apply OutDated Config [%d]", args.ConfigNum)
 	return
+}
+
+/*
+*
+shard 从wait pull状态到invalid
+*/
+func (kv *ShardKV) applyConfirmPull(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	args := msg.Command.(Op).Data.(*GCArgs)
+	if kv.gcReplyMap[args.Gid].ConfigNum >= args.ConfigNum {
+		DPrintf("Try Apply OutDated Confirm Pull")
+		return
+	}
+	for _, shard := range args.GCShard {
+		kv.shardStatus[shard] = Invalid
+	}
+	result := ApplyResult{
+		ErrMsg: OK,
+		Value:  "",
+		Term:   msg.CommandTerm,
+	}
+	if ch, ok := kv.replyChMap[msg.CommandIndex]; ok {
+		ch <- result
+	}
+	kv.lastAppliedIndex = msg.CommandIndex
+	kv.gcReplyMap[args.Gid] = GCReply{
+		ConfigNum: args.ConfigNum,
+		ErrMsg:    OK,
+	}
 }

@@ -1130,7 +1130,149 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 
 目前Group B 从Group A拉取到了分片并且apply, 更新了新分片的状态为`ServingButGC`,表示还没有垃圾回收。此时需要一个协程循环检查`ServingButGC`的分片，并且尝试通知Group A删除分片（其实也不用真的删除，Group A将分片状态更新为`Invalid`就行）
 
+注意分片状态都是状态机的一部分，所有状态的更改都要通过apply log来进行。
 
+```go
+// 守护进程，负责通知需要garbage collect分区的服务器组。
+func (kv *ShardKV) garbageCollector() {
+    wg := sync.WaitGroup{}
+    kv.mu.RLock()
+    gcShards := kv.getTargetGidAndShardsByStatus(ServingButGC)
+    for gid, shards := range gcShards {
+       wg.Add(1)
+       go func(config shardctrler.Config, gid int, shards []int) {
+          defer wg.Done()
+          servers := config.Groups[gid]
+          args := GCArgs{
+             GCShard:   shards,
+             ConfigNum: config.Num,
+             Gid:       kv.me,
+          }
+          for _, server := range servers {
+             var reply GCReply
+             if ok := kv.makeEnd(server).Call("ShardKV.GCHandler", &args, &reply); ok && reply.ErrMsg == OK {
+                kv.rf.Start(Op{
+                   OpType: ConfirmGC,
+                   Data:   args,
+                })
+                return
+             }
+          }
+       }(kv.cfg, gid, shards)
+    }
+    kv.mu.RUnlock()
+    wg.Wait()
+}
+
+type GCArgs struct {
+    GCShard   []int // 需要gc的shards
+    ConfigNum int   // 请求group的版本号。
+    Gid       int   // 请求group的id
+}
+type GCReply struct {
+    ConfigNum int // 请求group的版本号。
+    ErrMsg    Err
+}
+
+func (kv *ShardKV) GCHandler(args *GCArgs, reply *GCReply) {
+    kv.mu.Lock()
+    if prevReply, ok := kv.gcReplyMap[args.Gid]; ok && (prevReply.ErrMsg == OK) && (prevReply.ConfigNum == args.ConfigNum) {
+       reply.ErrMsg = OK
+       reply.ConfigNum = args.ConfigNum
+       return
+    }
+    if _, isleader := kv.rf.GetState(); !isleader {
+       reply.ErrMsg = ErrWrongLeader
+       return
+    }
+    if args.ConfigNum > kv.cfg.Num {
+       reply.ErrMsg = ErrNotReady
+       return
+    }
+    if args.ConfigNum < kv.cfg.Num {
+       // 不太可能发生这种情况，因为如果shard group没有完全同步，不会切换为下一个config
+       // 可能出现在重启的情况中？
+       reply.ErrMsg = ErrOutDate
+       return
+    }
+    index, currentTerm, isleader := kv.rf.Start(Op{
+       OpType: ConfirmPull,
+       Data:   *args,
+    })
+    if !isleader {
+       reply.ErrMsg = ErrWrongLeader
+       return
+    }
+    applyCh := make(chan ApplyResult, 1)
+    kv.replyChMap[index] = applyCh
+    kv.mu.Unlock()
+
+    select {
+    case replyMsg := <-applyCh:
+       {
+          if currentTerm != replyMsg.Term {
+             // 已经进入之后的term，leader改变（当前server可能仍然是leader，但是已经是几个term之后了）
+             // 说明执行的结果不是同一个log的
+             reply.ErrMsg = ErrWrongLeader
+             return
+          } else {
+             reply.ConfigNum = args.ConfigNum
+             reply.ErrMsg = OK
+          }
+       }
+    case <-time.After(500 * time.Millisecond):
+       {
+          reply.ErrMsg = ErrWrongLeader
+       }
+    }
+    go kv.CloseIndexCh(index)
+}
+func (kv *ShardKV) applyConfirmGC(msg raft.ApplyMsg) {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+    op := msg.Command.(Op)
+    args := op.Data.(GCArgs)
+    if args.ConfigNum == args.ConfigNum {
+       for _, shard := range args.GCShard {
+          kv.shardStatus[shard] = Serving
+       }
+       return
+    }
+    DPrintf("Try To Apply OutDated Config [%d]", reply.ConfigNum)
+    return
+}
+
+/*
+*
+shard 从wait pull状态到invalid
+*/
+func (kv *ShardKV) applyConfirmPull(msg raft.ApplyMsg) {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+
+    args := msg.Command.(Op).Data.(*GCArgs)
+    if kv.gcReplyMap[args.Gid].ConfigNum >= args.ConfigNum {
+       DPrintf("Try Apply OutDated Confirm Pull")
+       return
+    }
+    for _, shard := range args.GCShard {
+       kv.shardStatus[shard] = Invalid
+    }
+    result := ApplyResult{
+       ErrMsg: OK,
+       Value:  "",
+       Term:   msg.CommandTerm,
+    }
+    if ch, ok := kv.replyChMap[msg.CommandIndex]; ok {
+       ch <- result
+    }
+    kv.lastAppliedIndex = msg.CommandIndex
+    kv.gcReplyMap[args.Gid] = GCReply{
+       ConfigNum: args.ConfigNum,
+       ErrMsg:    OK,
+    }
+}
+```
 
 ## 一点建议
 
