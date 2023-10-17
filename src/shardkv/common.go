@@ -28,26 +28,29 @@ const (
 	ErrWrongGroup      = "ErrWrongGroup"
 	ErrWrongLeader     = "ErrWrongLeader"
 	ErrOutDate         = "ErrOutDate"
+	ErrNotReady        = "ErrNotReady"
 )
 
 type OpTypeT string
 
 const (
 	NewConfig       OpTypeT = "NewConfig"
-	PutOperation            = "Put"
-	GetOperation            = "Get"
-	AppendOperation         = "Append"
-	PullNewData             = "PullNewData"
+	PutOperation    OpTypeT = "Put"
+	GetOperation    OpTypeT = "Get"
+	AppendOperation OpTypeT = "Append"
+	PullNewData     OpTypeT = "PullNewData" // 拉取到了新分片
+	ConfirmGC       OpTypeT = "ConfirmGC"   // GC发起者确定 被Pull的group收到了GC请求，可以从GC-SERVE状态转为SERVE
+	ConfirmPull     OpTypeT = "ConfirmPull" // 被拉取的服务器确认拉取者已经拉取到，可以从Wait-pull状态转为INVALID状态
 )
 
 type ShardStatus string
 
 const (
 	Invalid      ShardStatus = "Invalid"
-	Serving                  = "Serving"
-	Pulling                  = "Pulling"
-	WaitPull                 = "WaitPull"
-	ServingButGC             = "ServingButGC"
+	Serving      ShardStatus = "Serving"
+	Pulling      ShardStatus = "Pulling"
+	WaitPull     ShardStatus = "WaitPull"
+	ServingButGC ShardStatus = "ServingButGC"
 )
 
 type Err string

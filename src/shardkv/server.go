@@ -37,6 +37,18 @@ type ShardData struct {
 	KvDB        KvDataBase               // 数据库
 	clientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
 }
+
+func (srcData *ShardData) clone() ShardData {
+	copyData := ShardData{}
+	copyData.clientReply = make(map[int64]CommandContext)
+	copyData.ShardNum = srcData.ShardNum
+	copyData.KvDB = srcData.KvDB.Clone()
+	for clinetId, msg := range srcData.clientReply {
+		copyData.clientReply[clinetId] = msg
+	}
+	return copyData
+}
+
 type ShardKV struct {
 	mu           sync.RWMutex
 	me           int
@@ -312,6 +324,8 @@ func (kv *ShardKV) applyCommand(msg raft.ApplyMsg) {
 		kv.applyDBModify(msg)
 	case NewConfig:
 		kv.applyNewConfig(op.Data.(shardctrler.Config))
+	case PullNewData:
+		kv.applyShard(op.Data.(PullDataReply))
 	default:
 		DPrintf("ERROR OP TYPE:%s", op.OpType)
 	}
@@ -406,7 +420,6 @@ func (kv *ShardKV) fetchNewConfig() {
 
 // 守护进程，负责获取新config的分区
 func (kv *ShardKV) pullData() {
-
 	wg := sync.WaitGroup{}
 	kv.mu.RLock()
 	pullingShards := kv.getTargetGidAndShardsByStatus(Pulling)
@@ -424,8 +437,8 @@ func (kv *ShardKV) pullData() {
 				var reply PullDataReply
 				if ok := kv.makeEnd(server).Call("ShardKV. PullData", &args, &reply); ok && reply.ErrMsg == OK {
 					kv.rf.Start(Op{
-						OpType: Pulling,
-						Data:   reply.Data,
+						OpType: PullNewData,
+						Data:   reply,
 					})
 				}
 			}
@@ -441,12 +454,32 @@ type PullDataArgs struct {
 	Gid         int   // 请求group的id
 }
 type PullDataReply struct {
-	Data   []ShardData
-	ErrMsg Err
+	Data      []ShardData
+	ConfigNum int // 请求group的版本号。
+	ErrMsg    Err
 }
 
 func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
-
+	kv.mu.RLock()
+	defer kv.mu.RUnlock() // todo 这里能否优化为细粒度锁?
+	if _, isleader := kv.rf.GetState(); !isleader {
+		reply.ErrMsg = ErrWrongLeader
+		return
+	}
+	if args.ConfigNum > kv.cfg.Num {
+		reply.ErrMsg = ErrNotReady
+		return
+	}
+	if args.ConfigNum < kv.cfg.Num {
+		// 不太可能发生这种情况，因为如果shard没有完全同步，不会切换为下一个config
+		panic(ErrOutDate)
+	}
+	for _, shard := range args.PulledShard {
+		reply.Data = append(reply.Data, kv.shardData[shard])
+	}
+	reply.ErrMsg = OK
+	reply.ConfigNum = kv.cfg.Num
+	return
 }
 func (kv *ShardKV) daemon(action func()) {
 	for !kv.killed() {
@@ -499,4 +532,80 @@ func (kv *ShardKV) getTargetGidAndShardsByStatus(targetStatus ShardStatus) map[i
 		}
 	}
 	return result
+}
+
+func (kv *ShardKV) applyShard(reply PullDataReply) {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	if reply.ConfigNum == kv.cfg.Num {
+		for _, shardData := range reply.Data {
+			kv.shardData[shardData.ShardNum] = shardData.clone()
+			kv.shardStatus[shardData.ShardNum] = ServingButGC
+		}
+	}
+	DPrintf("Try To Apply OutDated Config [%d]", reply.ConfigNum)
+	return
+}
+
+// 守护进程，负责通知需要garbage collect分区的服务器组。
+func (kv *ShardKV) garbageCollector() {
+	wg := sync.WaitGroup{}
+	kv.mu.RLock()
+	gcShards := kv.getTargetGidAndShardsByStatus(ServingButGC)
+	for gid, shards := range gcShards {
+		wg.Add(1)
+		go func(config shardctrler.Config, gid int, shards []int) {
+			defer wg.Done()
+			servers := config.Groups[gid]
+			args := GCArgs{
+				GCShard:   shards,
+				ConfigNum: config.Num,
+				Gid:       kv.me,
+			}
+			for _, server := range servers {
+				var reply GCReply
+				if ok := kv.makeEnd(server).Call("ShardKV. PullData", &args, &reply); ok && reply.ErrMsg == OK {
+					kv.rf.Start(Op{
+						OpType: ConfirmGC,
+						Data:   reply,
+					})
+				}
+			}
+		}(kv.cfg, gid, shards)
+	}
+	kv.mu.RUnlock()
+	wg.Wait()
+}
+
+type GCArgs struct {
+	GCShard   []int // 需要gc的shards
+	ConfigNum int   // 请求group的版本号。
+	Gid       int   // 请求group的id
+}
+type GCReply struct {
+	ConfigNum int // 请求group的版本号。
+	ErrMsg    Err
+}
+
+func (kv *ShardKV) GCHandler(args *PullDataArgs, reply *PullDataReply) {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock() // todo 这里能否优化为细粒度锁?
+	if _, isleader := kv.rf.GetState(); !isleader {
+		reply.ErrMsg = ErrWrongLeader
+		return
+	}
+	if args.ConfigNum > kv.cfg.Num {
+		reply.ErrMsg = ErrNotReady
+		return
+	}
+	if args.ConfigNum < kv.cfg.Num {
+		// 不太可能发生这种情况，因为如果shard没有完全同步，不会切换为下一个config
+		panic(ErrOutDate)
+	}
+	for _, shard := range args.PulledShard {
+		reply.Data = append(reply.Data, kv.shardData[shard])
+	}
+	reply.ErrMsg = OK
+	reply.ConfigNum = kv.cfg.Num
+	return
 }

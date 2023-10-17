@@ -1032,13 +1032,103 @@ const (
 
 
 
-然后Pull Data协程定时查看目前还有哪些分片没有，向对应的GID发起Pull请求。注意，Pull到之后也应该将Data通过Log的形式发送给Raft。Raft Apply这个包含分区的log之后，就可以将状态从Pulling转移到Serving了。
+然后Pull Data协程定时查看目前还有哪些分片没有，向对应的GID发起Pull请求。注意，Pull到之后也应该将Data通过Log的形式发送给Raft。Raft Apply这个包含分区的log之后，就可以将状态从Pulling转移到Serving了。注意这里分区发送使用深拷贝。
+
+```go
+func (srcData *ShardData) clone() ShardData  {
+    copyData:= ShardData{}
+    copyData.clientReply = make(map[int64]CommandContext)
+    copyData.ShardNum = srcData.ShardNum
+    copyData.KvDB = srcData.KvDB.Clone()
+    for clinetId,msg:=range srcData.clientReply {
+       copyData.clientReply[clinetId] = msg
+    }
+    return copyData
+}
+```
 
 但是之前拥有这个Shard的Server如何处理WaitPull状态呢。首先，WaitPull的shard被其他服务器Pull后，因为可能丢包，不能直接从WaitPull状态转移到Invalid状态。而是应当等到Group B(发起pull的Server)确认已经应用新分片，然后就能彻底清理这个分片。
 
 在此期间，Group B是处于`ServingButGC`状态， 表示虽然目前可以用这个分片了，但是还没有通知A ：“我已经收到了”。所以Group B还要定时检查这个状态的。
 
 现在A收到了清理请求，并在RAFT中Apply了，问题来了，如何告诉Group B已经清理掉了呢？单纯回复是不靠谱的。因为可能丢包，A也可能重复垃圾清理。应当使用类似于对Clerk去重的机制。**保存对其他Group的清理请求**。
+
+在写的时候想到了一个新问题：被Pull Data的leader是直接返回数据，还是将Pull Data的请求放进RAFT，并通过一个通道等待呢？我的看法是：如果满足条件可以直接返回。放进RAFT是为了保证线性性，但是当应用新配置后，所有发生改变的分区都被锁住了。
+
+
+
+```go
+// 守护进程，负责获取新config的分区
+func (kv *ShardKV) pullData() {
+
+    wg := sync.WaitGroup{}
+    kv.mu.RLock()
+    pullingShards := kv.getTargetGidAndShardsByStatus(Pulling)
+    for gid, shards := range pullingShards {
+       wg.Add(1)
+       go func(config shardctrler.Config, gid int, shards []int) {
+          defer wg.Done()
+          servers := config.Groups[gid]
+          args := PullDataArgs{
+             PulledShard: shards,
+             ConfigNum:   config.Num,
+             Gid:         kv.me,
+          }
+          for _, server := range servers {
+             var reply PullDataReply
+             if ok := kv.makeEnd(server).Call("ShardKV. PullData", &args, &reply); ok && reply.ErrMsg == OK {
+                kv.rf.Start(Op{
+                   OpType: Pulling,
+                   Data:   reply.Data,
+                })
+             }
+          }
+       }(kv.cfg, gid, shards)
+    }
+    kv.mu.RUnlock()
+    wg.Wait()
+}
+
+type PullDataArgs struct {
+    PulledShard []int // 需要拉取的shards
+    ConfigNum   int   // 请求group的版本号。
+    Gid         int   // 请求group的id
+}
+type PullDataReply struct {
+    Data      []ShardData
+    ConfigNum int // 请求group的版本号。
+    ErrMsg    Err
+}
+
+func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
+    kv.mu.RLock()
+    defer kv.mu.RUnlock() // todo 这里能否优化为细粒度锁?
+    if _, isleader := kv.rf.GetState(); !isleader {
+       reply.ErrMsg = ErrWrongLeader
+       return
+    }
+    if args.ConfigNum > kv.cfg.Num {
+       reply.ErrMsg = ErrNotReady
+       return
+    }
+    if args.ConfigNum < kv.cfg.Num {
+       // 不太可能发生这种情况，因为如果shard没有完全同步，不会切换为下一个config
+       panic(ErrOutDate)
+    }
+    for _, shard := range args.PulledShard {
+       reply.Data = append(reply.Data, kv.shardData[shard])
+    }
+    reply.ErrMsg = OK
+    reply.ConfigNum = kv.cfg.Num
+    return
+}
+```
+
+在获取了分片数据后，将分片数据放到RAFT中。等待执行。
+
+#### 垃圾回收
+
+目前Group B 从Group A拉取到了分片并且apply, 更新了新分片的状态为`ServingButGC`,表示还没有垃圾回收。此时需要一个协程循环检查`ServingButGC`的分片，并且尝试通知Group A删除分片（其实也不用真的删除，Group A将分片状态更新为`Invalid`就行）
 
 
 

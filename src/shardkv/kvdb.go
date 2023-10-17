@@ -7,6 +7,15 @@ type KvDataBase struct {
 func (kv *KvDataBase) Init() {
 	kv.KvData = make(map[string]string)
 }
+
+func (kv *KvDataBase) Clone() KvDataBase {
+	db := KvDataBase{}
+	db.KvData = make(map[string]string)
+	for key, value := range kv.KvData {
+		db.KvData[key] = value
+	}
+	return db
+}
 func (kv *KvDataBase) Get(key string) (value string, ok bool) {
 	if value, ok := kv.KvData[key]; ok {
 		return value, ok
