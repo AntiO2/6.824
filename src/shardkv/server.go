@@ -35,16 +35,16 @@ type CommandContext struct {
 type ShardData struct {
 	ShardNum    int                      // shard的编号
 	KvDB        KvDataBase               // 数据库
-	clientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
+	ClientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
 }
 
 func (srcData *ShardData) clone() ShardData {
 	copyData := ShardData{}
-	copyData.clientReply = make(map[int64]CommandContext)
+	copyData.ClientReply = make(map[int64]CommandContext)
 	copyData.ShardNum = srcData.ShardNum
 	copyData.KvDB = srcData.KvDB.Clone()
-	for clinetId, msg := range srcData.clientReply {
-		copyData.clientReply[clinetId] = msg
+	for clinetId, msg := range srcData.ClientReply {
+		copyData.ClientReply[clinetId] = msg
 	}
 	return copyData
 }
@@ -86,7 +86,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	}
-	if clientReply, ok := kv.shardData[shard].clientReply[args.ClientId]; ok {
+	if clientReply, ok := kv.shardData[shard].ClientReply[args.ClientId]; ok {
 		if args.CommandId == clientReply.CommandId {
 			reply.Value = clientReply.Reply.Value
 			reply.Err = clientReply.Reply.ErrMsg
@@ -114,7 +114,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("Leader[%d] Receive Op\t:%v\tIndex[%d]", kv.me, op, index)
+	DPrintf("Leader[%d.%d] Receive Op\t:%v\tIndex[%d]", kv.gid, kv.me, op, index)
 	replyCh := make(chan ApplyResult, 1)
 	kv.mu.Lock()
 	kv.replyChMap[index] = replyCh
@@ -142,7 +142,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("Server [%d] Receive Request\t:%v", kv.me, args)
+	// DPrintf("Server [%d.%d] Receive Request\t:%v", kv.gid, kv.me, args)
 	kv.mu.Lock()
 	shard := key2shard(args.Key)
 	if kv.cfg.Shards[shard] != kv.gid {
@@ -156,9 +156,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
-	if clientReply, ok := kv.shardData[shard].clientReply[args.ClientId]; ok {
+	if clientReply, ok := kv.shardData[shard].ClientReply[args.ClientId]; ok {
 		if args.CommandId == clientReply.CommandId {
 			DPrintf("Server [%d] Receive Same Command [%d]", kv.me, args.CommandId)
+			reply.Err = clientReply.Reply.ErrMsg
 			kv.mu.Unlock()
 			return
 		} else if args.CommandId < clientReply.CommandId {
@@ -184,7 +185,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		DPrintf("Client[%d] Isn't Leader", kv.me)
 		return
 	}
-	DPrintf("Leader[%d] Receive Op\t:%v\tIndex[%d]", kv.me, op, index)
+	DPrintf("Leader[%d.%d] Receive Op\t:%v\tIndex[%d]", kv.gid, kv.me, op, index)
 	replyCh := make(chan ApplyResult, 1)
 	kv.mu.Lock()
 	kv.replyChMap[index] = replyCh
@@ -280,12 +281,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.replyChMap = make(map[int]chan ApplyResult)
+	kv.gcReplyMap = make(map[int]GCReply)
 	// kv.cfg = kv.mck.Query(-1)
 	for i := 0; i < 10; i++ {
 		kv.shardData[i] = ShardData{}
 		kv.shardData[i].ShardNum = i
 		kv.shardData[i].KvDB.Init()
-		kv.shardData[i].clientReply = make(map[int64]CommandContext)
+		kv.shardData[i].ClientReply = make(map[int64]CommandContext)
 		kv.shardStatus[i] = Invalid
 	}
 
@@ -348,7 +350,7 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 	shardNum := key2shard(args.Key)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	commandContext, ok := kv.shardData[shardNum].clientReply[args.ClientId]
+	commandContext, ok := kv.shardData[shardNum].ClientReply[args.ClientId]
 	if ok && commandContext.CommandId >= args.CommandId {
 		// 该指令已经被应用过。
 		// applyResult = commandContext.Reply
@@ -389,7 +391,7 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 	if ok {
 		ch <- applyResult
 	}
-	kv.shardData[shardNum].clientReply[args.ClientId] = CommandContext{
+	kv.shardData[shardNum].ClientReply[args.ClientId] = CommandContext{
 		CommandId: args.CommandId,
 		Reply:     applyResult,
 	}
@@ -441,12 +443,12 @@ func (kv *ShardKV) pullData() {
 	pullingShards := kv.getTargetGidAndShardsByStatus(Pulling)
 	for gid, shards := range pullingShards {
 		wg.Add(1)
-		go func(config shardctrler.Config, gid int, shards []int) {
+		go func(config shardctrler.Config, gid int, shards []int, configNum int) {
 			defer wg.Done()
 			servers := config.Groups[gid]
 			args := PullDataArgs{
 				PulledShard: shards,
-				ConfigNum:   config.Num,
+				ConfigNum:   config.Num + 1,
 				Gid:         kv.me,
 			}
 			for _, server := range servers {
@@ -458,7 +460,7 @@ func (kv *ShardKV) pullData() {
 					})
 				}
 			}
-		}(kv.cfg, gid, shards)
+		}(kv.prevCfg, gid, shards, kv.cfg.Num)
 	}
 	kv.mu.RUnlock()
 	wg.Wait()
@@ -491,7 +493,7 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 		panic(ErrOutDate)
 	}
 	for _, shard := range args.PulledShard {
-		reply.Data = append(reply.Data, kv.shardData[shard])
+		reply.Data = append(reply.Data, kv.shardData[shard].clone())
 	}
 	reply.ErrMsg = OK
 	reply.ConfigNum = kv.cfg.Num
@@ -579,12 +581,12 @@ func (kv *ShardKV) garbageCollector() {
 	gcShards := kv.getTargetGidAndShardsByStatus(ServingButGC)
 	for gid, shards := range gcShards {
 		wg.Add(1)
-		go func(config shardctrler.Config, gid int, shards []int) {
+		go func(config shardctrler.Config, gid int, shards []int, cfgNum int) {
 			defer wg.Done()
 			servers := config.Groups[gid]
 			args := GCArgs{
 				GCShard:   shards,
-				ConfigNum: config.Num,
+				ConfigNum: cfgNum,
 				Gid:       kv.me,
 			}
 			for _, server := range servers {
@@ -597,7 +599,7 @@ func (kv *ShardKV) garbageCollector() {
 					return
 				}
 			}
-		}(kv.cfg, gid, shards)
+		}(kv.prevCfg, gid, shards, kv.cfg.Num)
 	}
 	kv.mu.RUnlock()
 	wg.Wait()
@@ -618,20 +620,24 @@ func (kv *ShardKV) GCHandler(args *GCArgs, reply *GCReply) {
 	if prevReply, ok := kv.gcReplyMap[args.Gid]; ok && (prevReply.ErrMsg == OK) && (prevReply.ConfigNum == args.ConfigNum) {
 		reply.ErrMsg = OK
 		reply.ConfigNum = args.ConfigNum
+		kv.mu.Unlock()
 		return
 	}
 	if _, isleader := kv.rf.GetState(); !isleader {
 		reply.ErrMsg = ErrWrongLeader
+		kv.mu.Unlock()
 		return
 	}
 	if args.ConfigNum > kv.cfg.Num {
 		reply.ErrMsg = ErrNotReady
+		kv.mu.Unlock()
 		return
 	}
 	if args.ConfigNum < kv.cfg.Num {
 		// 不太可能发生这种情况，因为如果shard group没有完全同步，不会切换为下一个config
 		// 可能出现在重启的情况中？
 		reply.ErrMsg = ErrOutDate
+		kv.mu.Unlock()
 		return
 	}
 	index, currentTerm, isleader := kv.rf.Start(Op{
@@ -640,6 +646,7 @@ func (kv *ShardKV) GCHandler(args *GCArgs, reply *GCReply) {
 	})
 	if !isleader {
 		reply.ErrMsg = ErrWrongLeader
+		kv.mu.Unlock()
 		return
 	}
 	applyCh := make(chan ApplyResult, 1)
@@ -690,7 +697,7 @@ func (kv *ShardKV) applyConfirmPull(msg raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	args := msg.Command.(Op).Data.(*GCArgs)
+	args := msg.Command.(Op).Data.(GCArgs)
 	if kv.gcReplyMap[args.Gid].ConfigNum >= args.ConfigNum {
 		DPrintf("Try Apply OutDated Confirm Pull")
 		return

@@ -153,5 +153,5 @@ func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, string(PutOperation))
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, string(GetOperation))
+	ck.PutAppend(key, value, string(AppendOperation))
 }
