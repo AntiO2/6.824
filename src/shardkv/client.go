@@ -92,7 +92,7 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					ck.lastAppliedCommandId = commandId
 					ck.groupLeader[gid] = si
-					DPrintf("Client[%v] Get k:[%v] v:[%v]", ck.clientId, key, reply.Value)
+					DPrintf("Client[%v] Get k:[%v] v:[%v] shard:[%v]", ck.clientId, key, reply.Value, shard)
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -133,7 +133,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok && reply.Err == OK {
 					ck.lastAppliedCommandId = commandId
 					ck.groupLeader[gid] = si
-					DPrintf("Client[%v]Success %v k:[%v] v:[%v]", ck.clientId, op, key, value)
+					DPrintf("Client[%v]Success %v k:[%v] v:[%v] shard:[%v]", ck.clientId, op, key, value, shard)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {

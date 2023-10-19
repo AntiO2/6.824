@@ -37,3 +37,7 @@ func (kv *KvDataBase) Append(key string, arg string) (newValue string) {
 	kv.KvData[key] = arg
 	return arg
 }
+
+func (kv *KvDataBase) Clear() {
+	kv.KvData = make(map[string]string)
+}

@@ -43,14 +43,14 @@ const (
 	ConfirmPull     OpTypeT = "ConfirmPull" // 被拉取的服务器确认拉取者已经拉取到，可以从Wait-pull状态转为INVALID状态
 )
 
-type ShardStatus string
+type ShardStatus int8
 
 const (
-	Invalid      ShardStatus = "Invalid"
-	Serving      ShardStatus = "Serving"
-	Pulling      ShardStatus = "Pulling"
-	WaitPull     ShardStatus = "WaitPull"
-	ServingButGC ShardStatus = "ServingButGC"
+	Invalid ShardStatus = iota
+	Serving
+	Pulling
+	WaitPull
+	ServingButGC
 )
 
 type Err string

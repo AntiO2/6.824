@@ -3,6 +3,8 @@ package shardkv
 import (
 	"6.824/labrpc"
 	"6.824/shardctrler"
+	"bytes"
+	"encoding/gob"
 	"sync/atomic"
 	"time"
 )
@@ -33,20 +35,26 @@ type CommandContext struct {
 	Reply     ApplyResult
 }
 type ShardData struct {
-	ShardNum    int                      // shard的编号
-	KvDB        KvDataBase               // 数据库
-	ClientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
+	ShardNum int        // shard的编号
+	KvDB     KvDataBase // 数据库
+	// ClientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
 }
 
 func (srcData *ShardData) clone() ShardData {
 	copyData := ShardData{}
-	copyData.ClientReply = make(map[int64]CommandContext)
+	// copyData.ClientReply = make(map[int64]CommandContext)
 	copyData.ShardNum = srcData.ShardNum
 	copyData.KvDB = srcData.KvDB.Clone()
-	for clinetId, msg := range srcData.ClientReply {
-		copyData.ClientReply[clinetId] = msg
-	}
+	//for clinetId, msg := range srcData.ClientReply {
+	//	copyData.ClientReply[clinetId] = msg
+	//}
 	return copyData
+}
+
+func (data *ShardData) clear() {
+	// data.ClientReply = make(map[int64]CommandContext)
+	data.KvDB.Clear()
+
 }
 
 type ShardKV struct {
@@ -60,6 +68,7 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 	// Your definitions here.
 	shardData        [shardctrler.NShards]ShardData
+	clientReply      map[int64]CommandContext
 	replyChMap       map[int]chan ApplyResult // log的index对应的返回信息。
 	gcReplyMap       map[int]GCReply
 	lastAppliedIndex int // kv数据库中最后应用的index.
@@ -86,7 +95,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	}
-	if clientReply, ok := kv.shardData[shard].ClientReply[args.ClientId]; ok {
+	if clientReply, ok := kv.clientReply[args.ClientId]; ok {
 		if args.CommandId == clientReply.CommandId {
 			reply.Value = clientReply.Reply.Value
 			reply.Err = clientReply.Reply.ErrMsg
@@ -156,7 +165,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
-	if clientReply, ok := kv.shardData[shard].ClientReply[args.ClientId]; ok {
+	if clientReply, ok := kv.clientReply[args.ClientId]; ok {
 		if args.CommandId == clientReply.CommandId {
 			DPrintf("Server [%d] Receive Same Command [%d]", kv.me, args.CommandId)
 			reply.Err = clientReply.Reply.ErrMsg
@@ -282,19 +291,21 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.replyChMap = make(map[int]chan ApplyResult)
 	kv.gcReplyMap = make(map[int]GCReply)
-	// kv.cfg = kv.mck.Query(-1)
+	kv.clientReply = make(map[int64]CommandContext)
 	for i := 0; i < 10; i++ {
 		kv.shardData[i] = ShardData{}
 		kv.shardData[i].ShardNum = i
 		kv.shardData[i].KvDB.Init()
-		kv.shardData[i].ClientReply = make(map[int64]CommandContext)
+		// kv.shardData[i].ClientReply = make(map[int64]CommandContext)
 		kv.shardStatus[i] = Invalid
 	}
-
+	kv.ReadSnapshot(persister.ReadSnapshot())
+	kv.lastAppliedIndex = int(kv.rf.GetLastIncludeIndex())
 	go kv.handleApplyMsg()
-	go kv.daemon(kv.fetchNewConfig)
-	go kv.daemon(kv.pullData)
-	go kv.daemon(kv.garbageCollector)
+	go kv.daemon(kv.fetchNewConfig, 100*time.Millisecond)
+	go kv.daemon(kv.pullData, 100*time.Millisecond)
+	go kv.daemon(kv.garbageCollector, 100*time.Millisecond)
+	go kv.makeSnapshot()
 	return kv
 }
 func (kv *ShardKV) handleApplyMsg() {
@@ -303,10 +314,13 @@ func (kv *ShardKV) handleApplyMsg() {
 
 		if applyMsg.CommandValid {
 			kv.applyCommand(applyMsg)
+			if kv.rf.GetRaftStateSize() > kv.maxraftstate && kv.maxraftstate != -1 {
+				kv.doSnapshot()
+			}
 			continue
 		}
 		if applyMsg.SnapshotValid {
-			// kv.applySnapshot(applyMsg)
+			kv.applySnapshot(applyMsg)
 			continue
 		}
 		DPrintf("Error Apply Msg: [%v]", applyMsg)
@@ -350,7 +364,7 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 	shardNum := key2shard(args.Key)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	commandContext, ok := kv.shardData[shardNum].ClientReply[args.ClientId]
+	commandContext, ok := kv.clientReply[args.ClientId]
 	if ok && commandContext.CommandId >= args.CommandId {
 		// 该指令已经被应用过。
 		// applyResult = commandContext.Reply
@@ -391,7 +405,7 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 	if ok {
 		ch <- applyResult
 	}
-	kv.shardData[shardNum].ClientReply[args.ClientId] = CommandContext{
+	kv.clientReply[args.ClientId] = CommandContext{
 		CommandId: args.CommandId,
 		Reply:     applyResult,
 	}
@@ -400,7 +414,7 @@ func (kv *ShardKV) applyNewConfig(idx int, config shardctrler.Config) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if config.Num <= kv.cfg.Num {
-		DPrintf("[%d]Try Apply Outdated Config[%d]", kv.me, config.Num)
+		DPrintf("[%d.%d]Try Apply Outdated Config[%d]", kv.gid, kv.me, config.Num)
 		return
 	}
 	for shard := 0; shard < shardctrler.NShards; shard++ {
@@ -416,11 +430,11 @@ func (kv *ShardKV) applyNewConfig(idx int, config shardctrler.Config) {
 	kv.lastAppliedIndex = idx
 }
 func (kv *ShardKV) fetchNewConfig() {
-	newCfg := kv.mck.Query(-1)
 	kv.mu.RLock()
-
-	if newCfg.Num > kv.cfg.Num {
-		kv.mu.RUnlock()
+	newCfgNum := kv.cfg.Num + 1
+	kv.mu.RUnlock()
+	newCfg := kv.mck.Query(newCfgNum) // 保证config递增
+	if newCfg.Num == newCfgNum {
 		// 配置发生了变化，检查自己不负责哪些shard了。
 		op := Op{
 			OpType: NewConfig,
@@ -431,9 +445,9 @@ func (kv *ShardKV) fetchNewConfig() {
 			kv.rf.Start(op)
 		}
 		kv.mu.Unlock()
+		time.Sleep(1000 * time.Millisecond)
 		return
 	}
-	kv.mu.RUnlock()
 }
 
 // 守护进程，负责获取新config的分区
@@ -448,8 +462,8 @@ func (kv *ShardKV) pullData() {
 			servers := config.Groups[gid]
 			args := PullDataArgs{
 				PulledShard: shards,
-				ConfigNum:   config.Num + 1,
-				Gid:         kv.me,
+				ConfigNum:   configNum,
+				Gid:         kv.gid,
 			}
 			for _, server := range servers {
 				var reply PullDataReply
@@ -472,12 +486,14 @@ type PullDataArgs struct {
 	Gid         int   // 请求group的id
 }
 type PullDataReply struct {
-	Data      []ShardData
-	ConfigNum int // 请求group的版本号。
-	ErrMsg    Err
+	Data        []ShardData
+	ClientReply map[int64]CommandContext
+	ConfigNum   int // 请求group的版本号。
+	ErrMsg      Err
 }
 
 func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
+
 	kv.mu.RLock()
 	defer kv.mu.RUnlock() // todo 这里能否优化为细粒度锁?
 	if _, isleader := kv.rf.GetState(); !isleader {
@@ -488,23 +504,27 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 		reply.ErrMsg = ErrNotReady
 		return
 	}
-	if args.ConfigNum < kv.cfg.Num {
-		// 不太可能发生这种情况，因为如果shard没有完全同步，不会切换为下一个config
-		panic(ErrOutDate)
-	}
+	//if args.ConfigNum < kv.cfg.Num {
+	//	// 如果发生这种情况，会怎么样？同步数据给一个过去的Data。
+	//	panic(ErrOutDate)
+	//}
 	for _, shard := range args.PulledShard {
 		reply.Data = append(reply.Data, kv.shardData[shard].clone())
+	}
+	reply.ClientReply = make(map[int64]CommandContext)
+	for key, value := range kv.clientReply {
+		reply.ClientReply[key] = value
 	}
 	reply.ErrMsg = OK
 	reply.ConfigNum = kv.cfg.Num
 	return
 }
-func (kv *ShardKV) daemon(action func()) {
+func (kv *ShardKV) daemon(action func(), duration time.Duration) {
 	for !kv.killed() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			action()
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(duration)
 	}
 }
 
@@ -569,6 +589,13 @@ func (kv *ShardKV) applyShard(idx int, reply PullDataReply) {
 			kv.shardData[shardData.ShardNum] = shardData.clone()
 			kv.shardStatus[shardData.ShardNum] = ServingButGC
 		}
+		for key, value := range reply.ClientReply {
+			prevContent, ok := kv.clientReply[key]
+			if !ok || prevContent.CommandId < value.CommandId {
+				kv.clientReply[key] = value
+			}
+		}
+
 	}
 	kv.lastAppliedIndex = idx
 	return
@@ -587,7 +614,7 @@ func (kv *ShardKV) garbageCollector() {
 			args := GCArgs{
 				GCShard:   shards,
 				ConfigNum: cfgNum,
-				Gid:       kv.me,
+				Gid:       kv.gid,
 			}
 			for _, server := range servers {
 				var reply GCReply
@@ -704,6 +731,7 @@ func (kv *ShardKV) applyConfirmPull(msg raft.ApplyMsg) {
 	}
 	for _, shard := range args.GCShard {
 		kv.shardStatus[shard] = Invalid
+		kv.shardData[shard].clear()
 	}
 	result := ApplyResult{
 		ErrMsg: OK,
@@ -719,4 +747,71 @@ func (kv *ShardKV) applyConfirmPull(msg raft.ApplyMsg) {
 		ErrMsg:    OK,
 	}
 	DPrintf("[%d.%d] Confirm Pull: [%d], Status:[%v]", kv.gid, kv.me, args.ConfigNum, kv.shardStatus)
+}
+func (kv *ShardKV) makeSnapshot() {
+	for !kv.killed() {
+		time.Sleep(time.Millisecond * 100)
+		kv.doSnapshot()
+	}
+}
+
+func (kv *ShardKV) doSnapshot() {
+	kv.mu.Lock()
+	sizeNow := kv.rf.GetRaftStateSize()
+	// DPrintf("Server[%d] Raft Size Is [%d] LastIncludeIndex [%d]", kv.me, sizeNow, kv.rf.GetLastIncludeIndex())
+	if sizeNow > kv.maxraftstate && kv.maxraftstate != -1 {
+		DPrintf("Server[%d.%d] Start to Make Snapshot", kv.gid, kv.me)
+		kv.rf.Snapshot(kv.lastAppliedIndex, kv.GenSnapshot())
+		DPrintf("Server[%d.%d] Raft Size Is [%d] After Snapshot", kv.gid, kv.me, kv.rf.GetRaftStateSize())
+	}
+	kv.mu.Unlock()
+}
+
+func (kv *ShardKV) GenSnapshot() []byte {
+	w := new(bytes.Buffer)
+	encode := gob.NewEncoder(w)
+	if encode.Encode(kv.cfg) != nil ||
+		encode.Encode(kv.prevCfg) != nil ||
+		encode.Encode(kv.shardStatus) != nil ||
+		encode.Encode(kv.gcReplyMap) != nil ||
+		encode.Encode(kv.clientReply) != nil {
+		panic("Can't Generate Snapshot")
+		return nil
+	}
+	for _, data := range kv.shardData {
+		if encode.Encode(data.clone()) != nil {
+			panic("Can't Generate Snapshot")
+			return nil
+		}
+	}
+
+	return w.Bytes()
+}
+func (kv *ShardKV) ReadSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	decode := gob.NewDecoder(r)
+	if decode.Decode(&kv.cfg) != nil ||
+		decode.Decode(&kv.prevCfg) != nil ||
+		decode.Decode(&kv.shardStatus) != nil ||
+		decode.Decode(&kv.gcReplyMap) != nil ||
+		decode.Decode(&kv.clientReply) != nil {
+		panic("Can't Read Snapshot")
+	}
+	for i, _ := range kv.shardData {
+		if decode.Decode(&kv.shardData[i]) != nil {
+			panic("Can't Read Snapshot")
+		}
+	}
+}
+
+func (kv *ShardKV) applySnapshot(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+		kv.lastAppliedIndex = msg.SnapshotIndex
+		kv.ReadSnapshot(msg.Snapshot)
+	}
 }

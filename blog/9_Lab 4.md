@@ -772,36 +772,36 @@ func key2shard(key string) int {
 
 ```go
 type Clerk struct {
-    sm       *shardctrler.Clerk
-    config   shardctrler.Config
-    make_end func(string) *labrpc.ClientEnd // 通过服务器名 （比如server1_a） 获得对应的client end
-    // You will have to modify this struct.
-    lastAppliedCommandId int         // 最后一次command的id
-    groupLeader          map[int]int // 缓存上次看到的某个gid对应的leader是谁。
-    clientId             int64       // 可以考虑复用sm clerk的id?
+	sm       *shardctrler.Clerk
+	config   shardctrler.Config
+	make_end func(string) *labrpc.ClientEnd // 通过服务器名 （比如server1_a） 获得对应的client end
+	// You will have to modify this struct.
+	lastAppliedCommandId int         // 最后一次command的id
+	groupLeader          map[int]int // 缓存上次看到的某个gid对应的leader是谁。
+	clientId             int64       // 可以考虑复用sm clerk的id?
 }
 
 // the tester calls MakeClerk.
 //
 // ctrlers[] is needed to call shardctrler.MakeClerk().
 //
-// make_end(servername) turns a server name from a
+// makeEnd(servername) turns a server name from a
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
-    ck := new(Clerk)
-    ck.sm = shardctrler.MakeClerk(ctrlers)
-    ck.make_end = make_end
-    // You'll have to add code here.
-    ck.lastAppliedCommandId = 0
-    ck.clientId = nrand()
-    ck.config = shardctrler.Config{
-       Num:    0,
-       Shards: [10]int{},
-       Groups: nil,
-    }
-    ck.groupLeader = make(map[int]int)
-    return ck
+	ck := new(Clerk)
+	ck.sm = shardctrler.MakeClerk(ctrlers)
+	ck.make_end = make_end
+	// You'll have to add code here.
+	ck.lastAppliedCommandId = 0
+	ck.clientId = nrand()
+	ck.config = shardctrler.Config{
+		Num:    0,
+		Shards: [10]int{},
+		Groups: nil,
+	}
+	ck.groupLeader = make(map[int]int)
+	return ck
 }
 ```
 
@@ -821,39 +821,40 @@ CommandId int
 ```go
 func (ck *Clerk) Get(key string) string {
 
-    commandId := ck.lastAppliedCommandId + 1
-    args := GetArgs{
-       Key:       key,
-       CommandId: commandId,
-       ClientId:  ck.clientId,
-    }
-    for {
-       shard := key2shard(key)
-       gid := ck.config.Shards[shard]
-       if servers, ok := ck.config.Groups[gid]; ok {
-          // try each server for the shard.
-          si := ck.groupLeader[gid] // 小优化： 使用上次发现的group leader
-          sn := len(servers)
-          for ; ; si = (si + 1) % sn {
-             srv := ck.make_end(servers[si])
-             var reply GetReply
-             ok := srv.Call("ShardKV.Get", &args, &reply)
-             if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-                ck.lastAppliedCommandId = commandId
-                ck.groupLeader[gid] = si
-                return reply.Value
-             }
-             if ok && (reply.Err == ErrWrongGroup) {
-                break
-             }
-             // ... not ok, or ErrWrongLeader
-          }
-       }
-       time.Sleep(100 * time.Millisecond)
-       // ask controler for the latest configuration.
-       ck.config = ck.sm.Query(-1)
-    }
-    return ""
+	commandId := ck.lastAppliedCommandId + 1
+	args := GetArgs{
+		Key:       key,
+		CommandId: commandId,
+		ClientId:  ck.clientId,
+	}
+	for {
+		shard := key2shard(key)
+		gid := ck.config.Shards[shard]
+		if servers, ok := ck.config.Groups[gid]; ok {
+			// try each server for the shard.
+			si := ck.groupLeader[gid] // 小优化： 使用上次发现的group leader
+			sn := len(servers)
+			for ; ; si = (si + 1) % sn {
+				srv := ck.make_end(servers[si])
+				var reply GetReply
+				ok := srv.Call("ShardKV.Get", &args, &reply)
+				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.lastAppliedCommandId = commandId
+					ck.groupLeader[gid] = si
+					DPrintf("Client[%v] Get k:[%v] v:[%v]", ck.clientId, key, reply.Value)
+					return reply.Value
+				}
+				if ok && (reply.Err == ErrWrongGroup) {
+					break
+				}
+				// ... not ok, or ErrWrongLeader
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+		// ask controler for the latest configuration.
+		ck.config = ck.sm.Query(-1)
+	}
+	return ""
 }
 
 // shared by Put and Append.
@@ -943,28 +944,26 @@ if kv.cfg.Shards[shard] != kv.gid {
 
 ```go
 func (kv *ShardKV) fetchNewConfig() {
-    newCfg := kv.mck.Query(-1)
-    if newCfg.Num != kv.cfg.Num {
-       // 配置发生了变化，检查自己不负责哪些shard了。
-       op := Op{
-          OpType: NewConfig,
-          Data:   newCfg,
-       }
-       kv.mu.Lock()
-       if _, isLeader := kv.rf.GetState(); isLeader {
-          kv.rf.Start(op)
-       }
-       kv.mu.Unlock()
-    }
+	newCfg := kv.mck.Query(-1)
+	kv.mu.RLock()
+
+	if newCfg.Num > kv.cfg.Num {
+		kv.mu.RUnlock()
+		// 配置发生了变化，检查自己不负责哪些shard了。
+		op := Op{
+			OpType: NewConfig,
+			Data:   newCfg,
+		}
+		kv.mu.Lock()
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			kv.rf.Start(op)
+		}
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.RUnlock()
 }
-func (kv *ShardKV) daemon(action func()) {
-    for !kv.killed() {
-       if _, isLeader := kv.rf.GetState(); isLeader {
-          action()
-       }
-       time.Sleep(100 * time.Millisecond)
-    }
-}
+
 ```
 
 
@@ -988,7 +987,7 @@ func (kv *ShardKV) daemon(action func()) {
 type ShardData struct {
     ShardNum    int                      // shard的编号
     KvDB        KvDataBase               // 数据库
-    clientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
+    ClientReply map[int64]CommandContext // 该shard中，缓存回复client的内容。
 }
 ```
 
@@ -1022,11 +1021,11 @@ type ShardData struct {
 type ShardStatus string
 
 const (
-    Serving  ShardStatus = "Serving"
-    Pulling              = "Pulling"
-    WaitPull             = "WaitPull"
-    Invalid              = "Invalid"
-	ServingButGC         = "ServingButGC"
+	Invalid      ShardStatus = "Invalid"
+	Serving      ShardStatus = "Serving"
+	Pulling      ShardStatus = "Pulling"
+	WaitPull     ShardStatus = "WaitPull"
+	ServingButGC ShardStatus = "ServingButGC"
 )
 ```
 
@@ -1060,33 +1059,32 @@ func (srcData *ShardData) clone() ShardData  {
 ```go
 // 守护进程，负责获取新config的分区
 func (kv *ShardKV) pullData() {
-
-    wg := sync.WaitGroup{}
-    kv.mu.RLock()
-    pullingShards := kv.getTargetGidAndShardsByStatus(Pulling)
-    for gid, shards := range pullingShards {
-       wg.Add(1)
-       go func(config shardctrler.Config, gid int, shards []int) {
-          defer wg.Done()
-          servers := config.Groups[gid]
-          args := PullDataArgs{
-             PulledShard: shards,
-             ConfigNum:   config.Num,
-             Gid:         kv.me,
-          }
-          for _, server := range servers {
-             var reply PullDataReply
-             if ok := kv.makeEnd(server).Call("ShardKV. PullData", &args, &reply); ok && reply.ErrMsg == OK {
-                kv.rf.Start(Op{
-                   OpType: Pulling,
-                   Data:   reply.Data,
-                })
-             }
-          }
-       }(kv.cfg, gid, shards)
-    }
-    kv.mu.RUnlock()
-    wg.Wait()
+	wg := sync.WaitGroup{}
+	kv.mu.RLock()
+	pullingShards := kv.getTargetGidAndShardsByStatus(Pulling)
+	for gid, shards := range pullingShards {
+		wg.Add(1)
+		go func(config shardctrler.Config, gid int, shards []int, configNum int) {
+			defer wg.Done()
+			servers := config.Groups[gid]
+			args := PullDataArgs{
+				PulledShard: shards,
+				ConfigNum:   config.Num + 1,
+				Gid:         kv.me,
+			}
+			for _, server := range servers {
+				var reply PullDataReply
+				if ok := kv.makeEnd(server).Call("ShardKV.PullData", &args, &reply); ok && reply.ErrMsg == OK {
+					kv.rf.Start(Op{
+						OpType: PullNewData,
+						Data:   reply,
+					})
+				}
+			}
+		}(kv.prevCfg, gid, shards, kv.cfg.Num)
+	}
+	kv.mu.RUnlock()
+	wg.Wait()
 }
 
 type PullDataArgs struct {
@@ -1101,30 +1099,32 @@ type PullDataReply struct {
 }
 
 func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
-    kv.mu.RLock()
-    defer kv.mu.RUnlock() // todo 这里能否优化为细粒度锁?
-    if _, isleader := kv.rf.GetState(); !isleader {
-       reply.ErrMsg = ErrWrongLeader
-       return
-    }
-    if args.ConfigNum > kv.cfg.Num {
-       reply.ErrMsg = ErrNotReady
-       return
-    }
-    if args.ConfigNum < kv.cfg.Num {
-       // 不太可能发生这种情况，因为如果shard没有完全同步，不会切换为下一个config
-       panic(ErrOutDate)
-    }
-    for _, shard := range args.PulledShard {
-       reply.Data = append(reply.Data, kv.shardData[shard])
-    }
-    reply.ErrMsg = OK
-    reply.ConfigNum = kv.cfg.Num
-    return
+	kv.mu.RLock()
+	defer kv.mu.RUnlock() // todo 这里能否优化为细粒度锁?
+	if _, isleader := kv.rf.GetState(); !isleader {
+		reply.ErrMsg = ErrWrongLeader
+		return
+	}
+	if args.ConfigNum > kv.cfg.Num {
+		reply.ErrMsg = ErrNotReady
+		return
+	}
+	if args.ConfigNum < kv.cfg.Num {
+		// 不太可能发生这种情况，因为如果shard没有完全同步，不会切换为下一个config
+		panic(ErrOutDate)
+	}
+	for _, shard := range args.PulledShard {
+		reply.Data = append(reply.Data, kv.shardData[shard].clone())
+	}
+	reply.ErrMsg = OK
+	reply.ConfigNum = kv.cfg.Num
+	return
 }
 ```
 
-在获取了分片数据后，将分片数据放到RAFT中。等待执行。
+在获取了分片数据后，将分片数据放到RAFT中。等待applier执行。
+
+注意这里有一个小设计：pull data中传config需要传前一个。因为server leave后，我的设计是config中会删除相关信息。所以新的config可能找不到要pull的server，需要从前一个config寻找。
 
 #### 垃圾回收
 
@@ -1135,33 +1135,33 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 ```go
 // 守护进程，负责通知需要garbage collect分区的服务器组。
 func (kv *ShardKV) garbageCollector() {
-    wg := sync.WaitGroup{}
-    kv.mu.RLock()
-    gcShards := kv.getTargetGidAndShardsByStatus(ServingButGC)
-    for gid, shards := range gcShards {
-       wg.Add(1)
-       go func(config shardctrler.Config, gid int, shards []int) {
-          defer wg.Done()
-          servers := config.Groups[gid]
-          args := GCArgs{
-             GCShard:   shards,
-             ConfigNum: config.Num,
-             Gid:       kv.me,
-          }
-          for _, server := range servers {
-             var reply GCReply
-             if ok := kv.makeEnd(server).Call("ShardKV.GCHandler", &args, &reply); ok && reply.ErrMsg == OK {
-                kv.rf.Start(Op{
-                   OpType: ConfirmGC,
-                   Data:   args,
-                })
-                return
-             }
-          }
-       }(kv.cfg, gid, shards)
-    }
-    kv.mu.RUnlock()
-    wg.Wait()
+	wg := sync.WaitGroup{}
+	kv.mu.RLock()
+	gcShards := kv.getTargetGidAndShardsByStatus(ServingButGC)
+	for gid, shards := range gcShards {
+		wg.Add(1)
+		go func(config shardctrler.Config, gid int, shards []int, cfgNum int) {
+			defer wg.Done()
+			servers := config.Groups[gid]
+			args := GCArgs{
+				GCShard:   shards,
+				ConfigNum: cfgNum,
+				Gid:       kv.me,
+			}
+			for _, server := range servers {
+				var reply GCReply
+				if ok := kv.makeEnd(server).Call("ShardKV.GCHandler", &args, &reply); ok && reply.ErrMsg == OK {
+					kv.rf.Start(Op{
+						OpType: ConfirmGC,
+						Data:   args,
+					})
+					return
+				}
+			}
+		}(kv.prevCfg, gid, shards, kv.cfg.Num)
+	}
+	kv.mu.RUnlock()
+	wg.Wait()
 }
 
 type GCArgs struct {
@@ -1175,71 +1175,77 @@ type GCReply struct {
 }
 
 func (kv *ShardKV) GCHandler(args *GCArgs, reply *GCReply) {
-    kv.mu.Lock()
-    if prevReply, ok := kv.gcReplyMap[args.Gid]; ok && (prevReply.ErrMsg == OK) && (prevReply.ConfigNum == args.ConfigNum) {
-       reply.ErrMsg = OK
-       reply.ConfigNum = args.ConfigNum
-       return
-    }
-    if _, isleader := kv.rf.GetState(); !isleader {
-       reply.ErrMsg = ErrWrongLeader
-       return
-    }
-    if args.ConfigNum > kv.cfg.Num {
-       reply.ErrMsg = ErrNotReady
-       return
-    }
-    if args.ConfigNum < kv.cfg.Num {
-       // 不太可能发生这种情况，因为如果shard group没有完全同步，不会切换为下一个config
-       // 可能出现在重启的情况中？
-       reply.ErrMsg = ErrOutDate
-       return
-    }
-    index, currentTerm, isleader := kv.rf.Start(Op{
-       OpType: ConfirmPull,
-       Data:   *args,
-    })
-    if !isleader {
-       reply.ErrMsg = ErrWrongLeader
-       return
-    }
-    applyCh := make(chan ApplyResult, 1)
-    kv.replyChMap[index] = applyCh
-    kv.mu.Unlock()
+	kv.mu.Lock()
+	if prevReply, ok := kv.gcReplyMap[args.Gid]; ok && (prevReply.ErrMsg == OK) && (prevReply.ConfigNum == args.ConfigNum) {
+		reply.ErrMsg = OK
+		reply.ConfigNum = args.ConfigNum
+		kv.mu.Unlock()
+		return
+	}
+	if _, isleader := kv.rf.GetState(); !isleader {
+		reply.ErrMsg = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	if args.ConfigNum > kv.cfg.Num {
+		reply.ErrMsg = ErrNotReady
+		kv.mu.Unlock()
+		return
+	}
+	if args.ConfigNum < kv.cfg.Num {
+		// 不太可能发生这种情况，因为如果shard group没有完全同步，不会切换为下一个config
+		// 可能出现在重启的情况中？
+		reply.ErrMsg = ErrOutDate
+		kv.mu.Unlock()
+		return
+	}
+	index, currentTerm, isleader := kv.rf.Start(Op{
+		OpType: ConfirmPull,
+		Data:   *args,
+	})
+	if !isleader {
+		reply.ErrMsg = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	applyCh := make(chan ApplyResult, 1)
+	kv.replyChMap[index] = applyCh
+	kv.mu.Unlock()
 
-    select {
-    case replyMsg := <-applyCh:
-       {
-          if currentTerm != replyMsg.Term {
-             // 已经进入之后的term，leader改变（当前server可能仍然是leader，但是已经是几个term之后了）
-             // 说明执行的结果不是同一个log的
-             reply.ErrMsg = ErrWrongLeader
-             return
-          } else {
-             reply.ConfigNum = args.ConfigNum
-             reply.ErrMsg = OK
-          }
-       }
-    case <-time.After(500 * time.Millisecond):
-       {
-          reply.ErrMsg = ErrWrongLeader
-       }
-    }
-    go kv.CloseIndexCh(index)
+	select {
+	case replyMsg := <-applyCh:
+		{
+			if currentTerm != replyMsg.Term {
+				// 已经进入之后的term，leader改变（当前server可能仍然是leader，但是已经是几个term之后了）
+				// 说明执行的结果不是同一个log的
+				reply.ErrMsg = ErrWrongLeader
+				return
+			} else {
+				reply.ConfigNum = args.ConfigNum
+				reply.ErrMsg = OK
+			}
+		}
+	case <-time.After(500 * time.Millisecond):
+		{
+			reply.ErrMsg = ErrWrongLeader
+		}
+	}
+	go kv.CloseIndexCh(index)
 }
 func (kv *ShardKV) applyConfirmGC(msg raft.ApplyMsg) {
-    kv.mu.Lock()
-    defer kv.mu.Unlock()
-    op := msg.Command.(Op)
-    args := op.Data.(GCArgs)
-    if args.ConfigNum == args.ConfigNum {
-       for _, shard := range args.GCShard {
-          kv.shardStatus[shard] = Serving
-       }
-       return
-    }
-    DPrintf("Try To Apply OutDated Config [%d]", reply.ConfigNum)
-    return
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	op := msg.Command.(Op)
+	args := op.Data.(GCArgs)
+	if args.ConfigNum == args.ConfigNum {
+		for _, shard := range args.GCShard {
+			kv.shardStatus[shard] = Serving
+		}
+		DPrintf("[%d.%d] ConfirmGC Config: [%d], Status:[%v]", kv.gid, kv.me, args.ConfigNum, kv.shardStatus)
+		return
+	}
+	DPrintf("Try To Apply OutDated Config [%d]", args.ConfigNum)
+	return
 }
 
 /*
@@ -1247,32 +1253,146 @@ func (kv *ShardKV) applyConfirmGC(msg raft.ApplyMsg) {
 shard 从wait pull状态到invalid
 */
 func (kv *ShardKV) applyConfirmPull(msg raft.ApplyMsg) {
-    kv.mu.Lock()
-    defer kv.mu.Unlock()
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
-    args := msg.Command.(Op).Data.(*GCArgs)
-    if kv.gcReplyMap[args.Gid].ConfigNum >= args.ConfigNum {
-       DPrintf("Try Apply OutDated Confirm Pull")
+	args := msg.Command.(Op).Data.(GCArgs)
+	if kv.gcReplyMap[args.Gid].ConfigNum >= args.ConfigNum {
+		DPrintf("Try Apply OutDated Confirm Pull")
+		return
+	}
+	for _, shard := range args.GCShard {
+		kv.shardStatus[shard] = Invalid
+	}
+	result := ApplyResult{
+		ErrMsg: OK,
+		Value:  "",
+		Term:   msg.CommandTerm,
+	}
+	if ch, ok := kv.replyChMap[msg.CommandIndex]; ok {
+		ch <- result
+	}
+	kv.lastAppliedIndex = msg.CommandIndex
+	kv.gcReplyMap[args.Gid] = GCReply{
+		ConfigNum: args.ConfigNum,
+		ErrMsg:    OK,
+	}
+	DPrintf("[%d.%d] Confirm Pull: [%d], Status:[%v]", kv.gid, kv.me, args.ConfigNum, kv.shardStatus)
+}
+
+```
+
+现在完成了前两个测试。
+
+
+
+### Snapshot
+
+首先，从KVServer迁移过来原始的Snapshot实现。
+
+接下来要考虑：什么状态需要放在Snapshot中呢？所有通过Raft Log改变的状态，需要进行快照。
+
+包括：
+
+- ShardData
+- Config
+- PrevConfig
+- ShardStatus
+- 垃圾回收的回复。
+
+然后我在这里发现了之前的一个错误：如果Group A从config1转换到config2,但是Group B此时又观察到了新的变化，从config1时获取到了config3,就会发生错误，因为可能Group A和Group B在不同的Config中对同一个shard负责。
+
+我的解决方法是每次获取新Config应该尝试获取当前配置的下一个，而不是直接`Query(-1)`
+
+然后是创建快照的代码。
+
+```go
+func (kv *ShardKV) makeSnapshot() {
+    for !kv.killed() {
+       time.Sleep(time.Millisecond * 100)
+       kv.mu.Lock()
+       sizeNow := kv.rf.GetRaftStateSize()
+       // DPrintf("Server[%d] Raft Size Is [%d] LastIncludeIndex [%d]", kv.me, sizeNow, kv.rf.GetLastIncludeIndex())
+       if sizeNow > kv.maxraftstate && kv.maxraftstate != -1 {
+          DPrintf("Server[%d.%d] Start to Make Snapshot", kv.gid, kv.me)
+          kv.rf.Snapshot(kv.lastAppliedIndex, kv.GenSnapshot())
+          DPrintf("Server[%d.%d] Raft Size Is [%d] After Snapshot", kv.gid, kv.me, kv.rf.GetRaftStateSize())
+       }
+       kv.mu.Unlock()
+    }
+}
+
+func (kv *ShardKV) GenSnapshot() []byte {
+    w := new(bytes.Buffer)
+    encode := gob.NewEncoder(w)
+    if encode.Encode(kv.cfg) != nil ||
+       encode.Encode(kv.prevCfg) != nil ||
+       encode.Encode(kv.shardStatus) != nil ||
+       encode.Encode(kv.gcReplyMap) != nil {
+       panic("Can't Generate Snapshot")
+       return nil
+    }
+    for _, data := range kv.shardData {
+       if encode.Encode(data.clone()) != nil {
+          panic("Can't Generate Snapshot")
+          return nil
+       }
+    }
+    return w.Bytes()
+}
+func (kv *ShardKV) ReadSnapshot(snapshot []byte) {
+    if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
        return
     }
-    for _, shard := range args.GCShard {
-       kv.shardStatus[shard] = Invalid
+    r := bytes.NewBuffer(snapshot)
+    decode := gob.NewDecoder(r)
+    if decode.Decode(&kv.cfg) != nil ||
+       decode.Decode(&kv.prevCfg) != nil ||
+       decode.Decode(&kv.shardStatus) != nil ||
+       decode.Decode(&kv.gcReplyMap) != nil {
+       panic("Can't Read Snapshot")
     }
-    result := ApplyResult{
-       ErrMsg: OK,
-       Value:  "",
-       Term:   msg.CommandTerm,
+    for i, _ := range kv.shardData {
+       if decode.Decode(&kv.shardData[i]) != nil {
+          panic("Can't Read Snapshot")
+       }
     }
-    if ch, ok := kv.replyChMap[msg.CommandIndex]; ok {
-       ch <- result
-    }
-    kv.lastAppliedIndex = msg.CommandIndex
-    kv.gcReplyMap[args.Gid] = GCReply{
-       ConfigNum: args.ConfigNum,
-       ErrMsg:    OK,
+}
+
+func (kv *ShardKV) applySnapshot(msg raft.ApplyMsg) {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+    if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+       kv.lastAppliedIndex = msg.SnapshotIndex
+       kv.ReadSnapshot(msg.Snapshot)
     }
 }
 ```
+
+这里在调试的时候发现的问题：因为快照会阻塞住apply。如果apply的速度慢的话，会导致makesnapshot的速度赶不上增长log的速度。就出现了一个情景：logs中全都是已经commit,但还没有apply的new config log。导致一直不能压缩日志。
+
+解决方法：如果fetchNewConfig发现了新的配置，就暂停一会（我设置的1s）,防止Log暴涨。
+
+
+
+## Challenge1:Garbage collection of state
+
+因为我们一开始就设计了：如果Group失去了shard的拥有权，不会立即删除，而是转到Wait Pull状态，并且确认了数据被Pull到，再转入Invalid状态。数据删除就可以放到Invalid状态的同时做。
+
+但是我在测试时总会超过预期字节一点。这里一开始没想到有什么问题。后来调试才看到。
+
+（这里假定分区对应key）因为不同的分片数据中存放回复客户端的信息。可能出现这种情况：Client1 在command1时，请求分片1，分片1存储回复在分片数剧中，然后在command2时，请求分片2。此时两个分片都存储了回复信息，但是实际上第一个已经没用了。
+
+解决方法：
+
+1. 每次存储新回复时，检查其他分片。
+2. 回复不分片，放在一个大map里面。
+
+这里选用第二种。注意要修改Pull Data和Apply Pull Data、Snapshot等的内容。
+
+总之核心就是不要保存过期的客户端信息。
+
+![image-20231020020457285](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20231020020457285.png)
 
 ## 一点建议
 
