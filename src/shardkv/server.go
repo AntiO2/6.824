@@ -261,6 +261,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Op{})
 	labgob.Register(shardctrler.Config{})
 	labgob.Register(DataArgs{})
+	labgob.Register(PullDataReply{})
+	labgob.Register(PullDataArgs{})
+	labgob.Register(GCArgs{})
+	labgob.Register(GCReply{})
 	kv := new(ShardKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
@@ -276,7 +280,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.replyChMap = make(map[int]chan ApplyResult)
-	kv.cfg = kv.mck.Query(-1)
+	// kv.cfg = kv.mck.Query(-1)
 	for i := 0; i < 10; i++ {
 		kv.shardData[i] = ShardData{}
 		kv.shardData[i].ShardNum = i
@@ -288,6 +292,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.handleApplyMsg()
 	go kv.daemon(kv.fetchNewConfig)
 	go kv.daemon(kv.pullData)
+	go kv.daemon(kv.garbageCollector)
 	return kv
 }
 func (kv *ShardKV) handleApplyMsg() {
@@ -353,7 +358,7 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 	case GetOperation:
 		{
 			value, ok := kv.shardData[shardNum].KvDB.Get(args.Key)
-			DPrintf("Server[%d.%d] Get K[%v] V[%v] From Shard[%d]", kv.gid, kv.me, args.Key, value, shardNum)
+			// DPrintf("Server[%d.%d] Get K[%v] V[%v] From Shard[%d]", kv.gid, kv.me, args.Key, value, shardNum)
 			if ok {
 				applyResult.Value = value
 				applyResult.ErrMsg = OK
@@ -365,7 +370,7 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 	case PutOperation:
 		{
 			value := kv.shardData[shardNum].KvDB.Put(args.Key, args.Value)
-			DPrintf("Server[%d.%d] Put K[%v] V[%v] To Shard[%d]", kv.gid, kv.me, args.Key, args.Value, shardNum)
+			// DPrintf("Server[%d.%d] Put K[%v] V[%v] To Shard[%d]", kv.gid, kv.me, args.Key, args.Value, shardNum)
 			applyResult.Value = value
 			applyResult.ErrMsg = OK
 		}
@@ -403,14 +408,17 @@ func (kv *ShardKV) applyNewConfig(idx int, config shardctrler.Config) {
 		}
 	}
 	kv.updateShardsStatus(config.Shards)
-	DPrintf("Server [%d.%d] Convert [%d]To new Config :[%v]", kv.gid, kv.me, kv.cfg.Num, config)
+	DPrintf("Server [%d.%d] Convert [%d]To new Config :[%v] Status:[%v]", kv.gid, kv.me, kv.cfg.Num, config, kv.shardStatus)
 	kv.prevCfg = kv.cfg
 	kv.cfg = config
 	kv.lastAppliedIndex = idx
 }
 func (kv *ShardKV) fetchNewConfig() {
 	newCfg := kv.mck.Query(-1)
+	kv.mu.RLock()
+
 	if newCfg.Num > kv.cfg.Num {
+		kv.mu.RUnlock()
 		// 配置发生了变化，检查自己不负责哪些shard了。
 		op := Op{
 			OpType: NewConfig,
@@ -421,7 +429,9 @@ func (kv *ShardKV) fetchNewConfig() {
 			kv.rf.Start(op)
 		}
 		kv.mu.Unlock()
+		return
 	}
+	kv.mu.RUnlock()
 }
 
 // 守护进程，负责获取新config的分区
@@ -507,12 +517,17 @@ func (kv *ShardKV) updateShardsStatus(newShards [10]int) {
 			// 本来该shard由本group负责， 但是现在应该迁移给别人
 			if newShards[shard] != 0 {
 				kv.shardStatus[shard] = WaitPull
+			} else {
+				kv.shardStatus[shard] = Invalid
 			}
 		}
 		if newShards[shard] == kv.gid && gid != kv.gid {
-			// 从别的shard迁移过来
 			if gid != 0 {
+				// 从别的shard迁移过来
 				kv.shardStatus[shard] = Pulling
+			} else {
+				// 从无效分片过来，直接开始服务
+				kv.shardStatus[shard] = Serving
 			}
 		}
 	}
@@ -533,11 +548,11 @@ func (kv *ShardKV) getTargetGidAndShardsByStatus(targetStatus ShardStatus) map[i
 			prevGid := kv.prevCfg.Shards[shardIndex]
 			if prevGid != 0 {
 				// 找到之前的GID，并加入shard编号
-				shards, ok := result[prevGid]
+				_, ok := result[prevGid]
 				if !ok {
-					shards = make([]int, 0)
+					result[prevGid] = make([]int, 0)
 				}
-				shards = append(shards, shardIndex) // todo 检查这里改变切片是否有效
+				result[prevGid] = append(result[prevGid], shardIndex)
 			}
 		}
 	}
@@ -660,6 +675,7 @@ func (kv *ShardKV) applyConfirmGC(msg raft.ApplyMsg) {
 		for _, shard := range args.GCShard {
 			kv.shardStatus[shard] = Serving
 		}
+		DPrintf("[%d.%d] ConfirmGC Config: [%d], Status:[%v]", kv.gid, kv.me, args.ConfigNum, kv.shardStatus)
 		return
 	}
 	DPrintf("Try To Apply OutDated Config [%d]", args.ConfigNum)
@@ -695,4 +711,5 @@ func (kv *ShardKV) applyConfirmPull(msg raft.ApplyMsg) {
 		ConfigNum: args.ConfigNum,
 		ErrMsg:    OK,
 	}
+	DPrintf("[%d.%d] Confirm Pull: [%d], Status:[%v]", kv.gid, kv.me, args.ConfigNum, kv.shardStatus)
 }

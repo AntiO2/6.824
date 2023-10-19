@@ -92,6 +92,7 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					ck.lastAppliedCommandId = commandId
 					ck.groupLeader[gid] = si
+					DPrintf("Client[%v] Get k:[%v] v:[%v]", ck.clientId, key, reply.Value)
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -123,7 +124,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			si := ck.groupLeader[gid] // 小优化： 使用上次发现的group leader
+			si := ck.groupLeader[gid] // 小优化： 优先使用上次发现的group leader
 			sn := len(servers)
 			for ; ; si = (si + 1) % sn {
 				srv := ck.make_end(servers[si])
@@ -132,6 +133,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok && reply.Err == OK {
 					ck.lastAppliedCommandId = commandId
 					ck.groupLeader[gid] = si
+					DPrintf("Client[%v]Success %v k:[%v] v:[%v]", ck.clientId, op, key, value)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
@@ -144,11 +146,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
+
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, PutOperation)
+	ck.PutAppend(key, value, string(PutOperation))
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, GetOperation)
+	ck.PutAppend(key, value, string(GetOperation))
 }
