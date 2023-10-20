@@ -12,7 +12,7 @@ import (
 //
 // You will have to modify these definitions.
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) {
 	if Debug {
@@ -41,16 +41,28 @@ const (
 	PullNewData     OpTypeT = "PullNewData" // 拉取到了新分片
 	ConfirmGC       OpTypeT = "ConfirmGC"   // GC发起者确定 被Pull的group收到了GC请求，可以从GC-SERVE状态转为SERVE
 	ConfirmPull     OpTypeT = "ConfirmPull" // 被拉取的服务器确认拉取者已经拉取到，可以从Wait-pull状态转为INVALID状态
+	EmptyLog        OpTypeT = "EmptyLog"
 )
 
-type ShardStatus int8
+// type ShardStatus int8
+//
+// const (
+//
+//	Invalid ShardStatus = iota
+//	Serving
+//	Pulling
+//	WaitPull
+//	ServingButGC
+//
+// )
+type ShardStatus string
 
 const (
-	Invalid ShardStatus = iota
-	Serving
-	Pulling
-	WaitPull
-	ServingButGC
+	Invalid      ShardStatus = "Invalid"
+	Serving      ShardStatus = "Serving"
+	Pulling      ShardStatus = "Pulling"
+	WaitPull     ShardStatus = "WaitPull"
+	ServingButGC ShardStatus = "ServingButGC"
 )
 
 type Err string

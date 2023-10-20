@@ -518,7 +518,7 @@ func (sc *ShardCtrler) reBalanceShard(config *Config) {
 			sc.moveShard(invalidShard.gid, minBackupQueue[0], invalidShard.shardNum, config)
 			minBackupQueue = minBackupQueue[1:]
 		}
-		log.Println("Can't assign invalidShard")
+		DPrintf("Can't assign invalidShard")
 	}
 
 }

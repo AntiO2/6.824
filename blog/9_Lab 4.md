@@ -1126,6 +1126,20 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 
 注意这里有一个小设计：pull data中传config需要传前一个。因为server leave后，我的设计是config中会删除相关信息。所以新的config可能找不到要pull的server，需要从前一个config寻找。
 
+
+
+这里一定要保证进入wait pull状态后，该GROUP就不能服务新的Key了。
+
+![image-20231020144944121](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20231020144944121.png)
+
+我在调试时就发现了这样的一个场景：
+
+假如Group102 在某个时刻pull了一个新config，并放入raft,之后在apply config之前又放入了一个新的Put Append Log, group会认为自己对该key负责（但实际上在新config中已经不负责了）。然后在config之后，该putappend之前，又发送了该shard给新的group，再在102中进行putAppend操作并返回给客户端，导致miss掉这个操作。这是因为在放入log之后，apply之前，group状态可能改变，这个过程并不是一直hold锁导致的。
+
+通过在读写操作时，再次判断能否服务该shard，解决了问题。
+
+![image-20231020145959808](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20231020145959808.png)
+
 #### 垃圾回收
 
 目前Group B 从Group A拉取到了分片并且apply, 更新了新分片的状态为`ServingButGC`,表示还没有垃圾回收。此时需要一个协程循环检查`ServingButGC`的分片，并且尝试通知Group A删除分片（其实也不用真的删除，Group A将分片状态更新为`Invalid`就行）
@@ -1375,7 +1389,9 @@ func (kv *ShardKV) applySnapshot(msg raft.ApplyMsg) {
 
 
 
-## Challenge1:Garbage collection of state
+## Challenge
+
+### 1:Garbage collection of state
 
 因为我们一开始就设计了：如果Group失去了shard的拥有权，不会立即删除，而是转到Wait Pull状态，并且确认了数据被Pull到，再转入Invalid状态。数据删除就可以放到Invalid状态的同时做。
 
@@ -1394,8 +1410,19 @@ func (kv *ShardKV) applySnapshot(msg raft.ApplyMsg) {
 
 ![image-20231020020457285](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20231020020457285.png)
 
+### 2.Client requests during configuration changes
+
+因为一开始设计就是分片处理的，所以没修改就过了。
+
 ## 一点建议
 
 1. 在最开始，先不要考虑太多。比如一开始就想网络分区会怎么办，延迟会怎么办，重启会怎么办？同时思考会导致思路挺乱。不要怕代码重构。
 2. 每完成一点代码，可能之前测试通过的功能会出现bug，先保证之前的正确。
+3. 仔细思考程序的执行顺序。想一下什么操作是原子的，什么不是？
+4. 代码：[MIT6.824/src/shardkv at master · AntiO2/MIT6.824 (github.com)](https://github.com/AntiO2/MIT6.824/tree/master/src/shardkv)
 
+
+
+最后放一张大圆满截图
+
+![image-20231020160146351](https://antio2-1258695065.cos.ap-chengdu.myqcloud.com/img/blogimage-20231020160146351.png)

@@ -113,7 +113,7 @@ func TestJoinLeave(t *testing.T) {
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
-
+	DPrintf("Join 1")
 	cfg.join(1)
 
 	for i := 0; i < n; i++ {
@@ -122,9 +122,8 @@ func TestJoinLeave(t *testing.T) {
 		ck.Append(ka[i], x)
 		va[i] += x
 	}
-
+	DPrintf("Leave 0")
 	cfg.leave(0)
-
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 		x := randstring(5)
@@ -136,8 +135,9 @@ func TestJoinLeave(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	cfg.checklogs()
-	cfg.ShutdownGroup(0)
 
+	cfg.ShutdownGroup(0)
+	DPrintf("ShutdownGroup(0) ")
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
@@ -482,7 +482,7 @@ func TestConcurrent3(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		ck1 := cfg.makeClient()
-		go ff(i, ck1)
+		go ff(i, ck1) // 连续对1-10进行append操作。
 	}
 
 	t0 := time.Now()
@@ -517,6 +517,78 @@ func TestConcurrent3(t *testing.T) {
 	fmt.Printf("  ... Passed\n")
 }
 
+// 有规律的
+func TestConcurrent4(t *testing.T) {
+	fmt.Printf("Test: concurrent configuration change and restart...\n")
+
+	cfg := make_config(t, 3, false, 300)
+	defer cfg.cleanup()
+
+	ck := cfg.makeClient()
+
+	cfg.join(0)
+
+	n := 10
+	ka := make([]string, n)
+	va := make([]string, n)
+	vn := make([]int, n)
+
+	for i := 0; i < n; i++ {
+		ka[i] = strconv.Itoa(i)
+		vn[i] = 1
+		va[i] = strconv.Itoa(vn[i])
+		ck.Put(ka[i], va[i])
+	}
+
+	var done int32
+	ch := make(chan bool)
+
+	ff := func(i int, ck1 *Clerk) {
+		defer func() { ch <- true }()
+		for atomic.LoadInt32(&done) == 0 {
+			vn[i]++
+			x := "_" + strconv.Itoa(vn[i])
+			ck1.Append(ka[i], x)
+			va[i] += x
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		ck1 := cfg.makeClient()
+		go ff(i, ck1) // 连续对1-10进行append操作。
+	}
+
+	t0 := time.Now()
+	for time.Since(t0) < 5*time.Second {
+		cfg.join(2)
+		cfg.join(1)
+		time.Sleep(time.Duration(rand.Int()%400) * time.Millisecond)
+		cfg.ShutdownGroup(0)
+		cfg.ShutdownGroup(1)
+		cfg.ShutdownGroup(2)
+		cfg.StartGroup(0)
+		cfg.StartGroup(1)
+		cfg.StartGroup(2)
+
+		time.Sleep(time.Duration(rand.Int()%400) * time.Millisecond)
+		cfg.leave(1)
+		cfg.leave(2)
+		time.Sleep(time.Duration(rand.Int()%400) * time.Millisecond)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	atomic.StoreInt32(&done, 1)
+	for i := 0; i < n; i++ {
+		<-ch
+	}
+
+	for i := 0; i < n; i++ {
+		check(t, ck, ka[i], va[i])
+	}
+
+	fmt.Printf("  ... Passed\n")
+}
 func TestUnreliable1(t *testing.T) {
 	fmt.Printf("Test: unreliable 1...\n")
 

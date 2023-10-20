@@ -191,7 +191,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		DPrintf("Client[%d] Isn't Leader", kv.me)
+		// DPrintf("Server[%d.%d] Isn't Leader", kv.gid, kv.me)
 		return
 	}
 	DPrintf("Leader[%d.%d] Receive Op\t:%v\tIndex[%d]", kv.gid, kv.me, op, index)
@@ -302,9 +302,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ReadSnapshot(persister.ReadSnapshot())
 	kv.lastAppliedIndex = int(kv.rf.GetLastIncludeIndex())
 	go kv.handleApplyMsg()
-	go kv.daemon(kv.fetchNewConfig, 100*time.Millisecond)
+	go kv.daemon(kv.fetchNewConfig, 50*time.Millisecond)
 	go kv.daemon(kv.pullData, 100*time.Millisecond)
 	go kv.daemon(kv.garbageCollector, 100*time.Millisecond)
+	go kv.daemon(kv.testEmptyLog, 200*time.Millisecond)
 	go kv.makeSnapshot()
 	return kv
 }
@@ -352,6 +353,8 @@ func (kv *ShardKV) applyCommand(msg raft.ApplyMsg) {
 		kv.applyConfirmGC(msg)
 	case ConfirmPull:
 		kv.applyConfirmPull(msg)
+	case EmptyLog:
+		kv.applyEmptyLog(msg)
 	default:
 		DPrintf("ERROR OP TYPE:%s", op.OpType)
 	}
@@ -368,6 +371,14 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 	if ok && commandContext.CommandId >= args.CommandId {
 		// 该指令已经被应用过。
 		// applyResult = commandContext.Reply
+		return
+	}
+	if !kv.canServe(shardNum) {
+		ch, ok := kv.replyChMap[msg.CommandIndex]
+		applyResult.ErrMsg = ErrWrongLeader
+		if ok {
+			ch <- applyResult
+		}
 		return
 	}
 	switch op.OpType {
@@ -393,7 +404,7 @@ func (kv *ShardKV) applyDBModify(msg raft.ApplyMsg) {
 	case AppendOperation:
 		{
 			value := kv.shardData[shardNum].KvDB.Append(args.Key, args.Value)
-			DPrintf("Server[%d.%d] Append K[%v] V[%v] To Shard[%d]", kv.gid, kv.me, args.Key, args.Value, shardNum)
+			DPrintf("Server[%d.%d] Append K[%v] V[%v] To Shard[%d] ShardStatus[%v]", kv.gid, kv.me, args.Key, args.Value, shardNum, kv.shardStatus)
 			applyResult.Value = value
 			applyResult.ErrMsg = OK
 		}
@@ -428,11 +439,13 @@ func (kv *ShardKV) applyNewConfig(idx int, config shardctrler.Config) {
 	kv.prevCfg = kv.cfg
 	kv.cfg = config
 	kv.lastAppliedIndex = idx
+	go kv.pullData()
 }
 func (kv *ShardKV) fetchNewConfig() {
 	kv.mu.RLock()
 	newCfgNum := kv.cfg.Num + 1
 	kv.mu.RUnlock()
+
 	newCfg := kv.mck.Query(newCfgNum) // 保证config递增
 	if newCfg.Num == newCfgNum {
 		// 配置发生了变化，检查自己不负责哪些shard了。
@@ -440,12 +453,12 @@ func (kv *ShardKV) fetchNewConfig() {
 			OpType: NewConfig,
 			Data:   newCfg,
 		}
-		kv.mu.Lock()
+		// kv.mu.Lock()
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			kv.rf.Start(op)
 		}
-		kv.mu.Unlock()
-		time.Sleep(1000 * time.Millisecond)
+		// kv.mu.Unlock()
+		time.Sleep(100 * time.Millisecond)
 		return
 	}
 }
@@ -454,6 +467,10 @@ func (kv *ShardKV) fetchNewConfig() {
 func (kv *ShardKV) pullData() {
 	wg := sync.WaitGroup{}
 	kv.mu.RLock()
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		kv.mu.RUnlock()
+		return
+	}
 	pullingShards := kv.getTargetGidAndShardsByStatus(Pulling)
 	for gid, shards := range pullingShards {
 		wg.Add(1)
@@ -495,7 +512,7 @@ type PullDataReply struct {
 func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 
 	kv.mu.RLock()
-	defer kv.mu.RUnlock() // todo 这里能否优化为细粒度锁?
+	defer kv.mu.RUnlock()
 	if _, isleader := kv.rf.GetState(); !isleader {
 		reply.ErrMsg = ErrWrongLeader
 		return
@@ -586,8 +603,15 @@ func (kv *ShardKV) applyShard(idx int, reply PullDataReply) {
 	defer kv.mu.Unlock()
 	if reply.ConfigNum == kv.cfg.Num {
 		for _, shardData := range reply.Data {
-			kv.shardData[shardData.ShardNum] = shardData.clone()
-			kv.shardStatus[shardData.ShardNum] = ServingButGC
+			if kv.shardStatus[shardData.ShardNum] == Pulling {
+				// 注意不要被重复的pull data覆盖了状态。
+				DPrintf("[%d.%d] Apply Shard Data[%d.%d]:[%v]", kv.gid, kv.me, kv.cfg.Num, shardData.ShardNum, shardData.KvDB.KvData)
+				kv.shardData[shardData.ShardNum] = shardData.clone()
+				kv.shardStatus[shardData.ShardNum] = ServingButGC
+			} else {
+				DPrintf("[%d.%d] Avoid Covering Data", kv.gid, kv.me)
+			}
+
 		}
 		for key, value := range reply.ClientReply {
 			prevContent, ok := kv.clientReply[key]
@@ -710,6 +734,7 @@ func (kv *ShardKV) applyConfirmGC(msg raft.ApplyMsg) {
 			kv.shardStatus[shard] = Serving
 		}
 		DPrintf("[%d.%d] ConfirmGC Config: [%d], Status:[%v]", kv.gid, kv.me, args.ConfigNum, kv.shardStatus)
+		kv.lastAppliedIndex = msg.CommandIndex
 		return
 	}
 	DPrintf("Try To Apply OutDated Config [%d]", args.ConfigNum)
@@ -746,6 +771,7 @@ func (kv *ShardKV) applyConfirmPull(msg raft.ApplyMsg) {
 		ConfigNum: args.ConfigNum,
 		ErrMsg:    OK,
 	}
+	kv.lastAppliedIndex = msg.CommandIndex
 	DPrintf("[%d.%d] Confirm Pull: [%d], Status:[%v]", kv.gid, kv.me, args.ConfigNum, kv.shardStatus)
 }
 func (kv *ShardKV) makeSnapshot() {
@@ -760,9 +786,9 @@ func (kv *ShardKV) doSnapshot() {
 	sizeNow := kv.rf.GetRaftStateSize()
 	// DPrintf("Server[%d] Raft Size Is [%d] LastIncludeIndex [%d]", kv.me, sizeNow, kv.rf.GetLastIncludeIndex())
 	if sizeNow > kv.maxraftstate && kv.maxraftstate != -1 {
-		DPrintf("Server[%d.%d] Start to Make Snapshot", kv.gid, kv.me)
+		// DPrintf("Server[%d.%d] Start to Make Snapshot", kv.gid, kv.me)
 		kv.rf.Snapshot(kv.lastAppliedIndex, kv.GenSnapshot())
-		DPrintf("Server[%d.%d] Raft Size Is [%d] After Snapshot", kv.gid, kv.me, kv.rf.GetRaftStateSize())
+		// DPrintf("Server[%d.%d] Raft Size Is [%d] After Snapshot", kv.gid, kv.me, kv.rf.GetRaftStateSize())
 	}
 	kv.mu.Unlock()
 }
@@ -814,4 +840,21 @@ func (kv *ShardKV) applySnapshot(msg raft.ApplyMsg) {
 		kv.lastAppliedIndex = msg.SnapshotIndex
 		kv.ReadSnapshot(msg.Snapshot)
 	}
+}
+func (kv *ShardKV) canServe(shardNum int) bool {
+	return kv.cfg.Shards[shardNum] == kv.gid && (kv.shardStatus[shardNum] == Serving || kv.shardStatus[shardNum] == ServingButGC)
+}
+
+// 定时添加空日志
+func (kv *ShardKV) testEmptyLog() {
+	kv.rf.Start(Op{
+		OpType: EmptyLog,
+		Data:   nil,
+	})
+}
+
+func (kv *ShardKV) applyEmptyLog(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.lastAppliedIndex = msg.CommandIndex
 }
